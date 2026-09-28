@@ -22,6 +22,8 @@ async function freshStore(): Promise<Store> {
 }
 
 async function resetTables() {
+  // Ensure schema exists first (fresh CI database), then clear it.
+  await createPostgresStore(PG_URL!);
   const pool = new pg.Pool({ connectionString: PG_URL });
   await pool.query("TRUNCATE lightflow_events, lightflow_runs");
   await pool.end();

@@ -92,6 +92,8 @@ function makeRunHandle(runId: string): VercelRun {
   };
 
   const cache: { status?: VercelRunStatus } = {};
+  let lazyReturnValue: Promise<unknown> | undefined;
+  let pendingRejection: unknown;
   const handle: VercelRun = {
     runId,
     exists: true,
@@ -103,10 +105,24 @@ function makeRunHandle(runId: string): VercelRun {
         return st;
       });
     },
-    returnValue: (async () => {
-      await terminal(cache);
-      return (await engine.getRun(runId)).returnValue;
-    })(),
+    // Lazy: created on first access so a handle whose returnValue is never
+    // awaited (e.g. status-only getRun polls) can't produce an unhandled
+    // rejection when the run fails.
+    get returnValue() {
+      if (!lazyReturnValue) {
+        lazyReturnValue = (async () => {
+          try {
+            await terminal(cache);
+            return await (await engine.getRun(runId)).returnValue;
+          } catch (e) {
+            pendingRejection = e;
+            throw e;
+          }
+        })();
+        if (pendingRejection) throw pendingRejection; // unreachable
+      }
+      return lazyReturnValue;
+    },
     getReadable<T>(opts?: { startIndex?: number }) {
       const startIndex = opts?.startIndex ?? 0;
       let sent = startIndex;

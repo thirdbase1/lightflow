@@ -334,6 +334,10 @@ export class Engine {
     let resolve!: (v: unknown) => void;
     let reject!: (e: unknown) => void;
     const promise = new Promise<unknown>((res, rej) => { resolve = res; reject = rej; });
+    // Prevent unhandled-rejection crashes when a caller (e.g. compat
+    // returnValue path) never awaits the local deferred — status is read
+    // from the store instead.
+    promise.catch(() => {});
     const d = { promise, resolve, reject };
     this.local.set(runId, d);
     return d;

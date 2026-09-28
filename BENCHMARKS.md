@@ -156,6 +156,10 @@ same Postgres (16, local) and the same harness (200 runs x 5 steps @ conc 20;
 | 0.2.4 | 456.1 | 2,280 | 8,280 |
 | 0.2.5 | 459.1 | 2,295 | 9,068 |
 | 0.2.6 | 494.9–525.1 | 2,474–2,626 | 8,379–9,737 |
+| 0.2.7 | 416.0 | 2,080 | 9,180 |
+| 0.2.8 | 455.2 | 2,276 | 8,695 |
+| 0.2.9 | 474.1 | 2,371 | 9,008 |
+| 0.2.10 | 455.3 | 2,277 | 9,368 |
 
 ### What changed per version (all perf-neutral by design)
 
@@ -178,6 +182,14 @@ same Postgres (16, local) and the same harness (200 runs x 5 steps @ conc 20;
   resolved the package root, but the types were broken).
 - **0.2.6** — `export { workflowFetch as fetch }` (entry imports both
   names), `WorkflowFn` accepts typed args, `run.exists: true`.
+- **0.2.7** — lazy `returnValue` on run handles: no unhandled rejection
+  when a status-only handle outlives a failed run. Added
+  `test/compat-runtime.ts` (makeStep args+retries, FatalError, ghost runs).
+- **0.2.8–0.2.10** — cross-bundle runtime state for Next.js: engine/store,
+  workflow/step registries, and the execution context moved to globalThis
+  because instrumentation and route handlers load as separate module
+  instances. Found by a live end-to-end Entry chat run; zero measurable
+  cost (globalThis lookup vs module global).
 
 ### Spread notes
 

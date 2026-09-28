@@ -9,7 +9,12 @@
  */
 
 import { createHash, randomUUID } from "node:crypto";
-import { FatalError, CancelledError } from "../index.js";
+import {
+  FatalError,
+  CancelledError,
+  step,
+  registerStep,
+} from "../index.js";
 import { current } from "../index.js";
 
 export { FatalError, CancelledError, sleep } from "../index.js";
@@ -73,4 +78,36 @@ export function workflowIdFor(fn: (...a: unknown[]) => Promise<unknown>): string
   if (named && named !== "anonymous") return named;
   return "wf_" + createHash("sha256")
     .update(String(fn).slice(0, 512)).digest("hex").slice(0, 16);
+}
+
+/**
+ * makeStep — turns a plain async function into a durable step callable.
+ *
+ * Entry's "use step" functions take arguments; lightflow's step() takes a
+ * thunk. makeStep wraps both: the returned function is a drop-in for the
+ * original (same signature), but each call becomes a memoized, retrying,
+ * replayable step keyed by call position. Outside a workflow it degrades
+ * to a plain call, so tests and non-durable paths keep working.
+ */
+export function makeStep<A extends unknown[], R>(
+  fn: (...args: A) => Promise<R>,
+  opts?: { retries?: number },
+): (...args: A) => Promise<R> {
+  const wrapped = async (...args: A): Promise<R> =>
+    step(() => fn(...args));
+  Object.defineProperty(wrapped, "__lightflowStepId", {
+    value: `step_${workflowIdFor(fn as (...a: unknown[]) => Promise<unknown>)}`,
+    enumerable: false,
+  });
+  if (opts?.retries !== undefined) {
+    Object.defineProperty(wrapped, "__lightflowRetries", {
+      value: opts.retries,
+      enumerable: false,
+    });
+  }
+  registerStep(
+    (wrapped as unknown as { __lightflowStepId: string }).__lightflowStepId,
+    fn as (...a: unknown[]) => Promise<unknown>,
+  );
+  return wrapped;
 }

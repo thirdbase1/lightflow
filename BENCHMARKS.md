@@ -141,18 +141,59 @@ sequential-ish workflows through `start()` + terminal-poll.
 Every version's table above was produced on the same machine and database,
 so cross-version rows are directly comparable.
 
-## v0.2.0 — compat layer (perf-neutral)
+## v0.2.x — compat layer (all versions re-benchmarked)
 
-Focus: Vercel Workflow drop-in compat (`lightflow-engine/compat/*`).
-No perf regression vs v0.1.4 — two real bugs found and fixed along the way:
-post-resume chunk loss (chunk keys now include the durable-timer position)
-and chunks vanishing from streams after snapshot compaction (live chunks
-now fold into snapshots).
+Each published version was benchmarked from its published tarball against the
+same Postgres (16, local) and the same harness (200 runs x 5 steps @ conc 20;
+50 runs x 400 steps). Steps/wf = 5 for short, 400 for long.
 
-| Scenario | v0.1.4 | v0.2.0 |
-|---|---|---|
-| 200 runs x 5 steps, conc 20 (runs/s) | 502–512 | 504.5 |
-| 50 runs x 400 steps durable (steps/s) | 9,939 | 9,062–10,600 |
+| Version | Short runs/s | Short steps/s | Long steps/s |
+|---|---|---|---|
+| 0.2.0 | 462.7 | 2,313 | 8,493 |
+| 0.2.1 | 466.0 | 2,330 | 9,062 |
+| 0.2.2 | 466.9 | 2,335 | 8,348 |
+| 0.2.3 | 461.6 | 2,308 | 8,384 |
+| 0.2.4 | 456.1 | 2,280 | 8,280 |
+| 0.2.5 | 459.1 | 2,295 | 9,068 |
+| 0.2.6 | 494.9–525.1 | 2,474–2,626 | 8,379–9,737 |
 
-Verdict: perf-neutral within noise. Compat test (7/7) exercises the full
-entry-agents surface end-to-end.
+### What changed per version (all perf-neutral by design)
+
+- **0.2.0** — Vercel Workflow drop-in compat (`compat/workflow`,
+  `compat/api`, `compat/next`). Two data-loss bugs fixed en route: chunk
+  memo keys now include the durable-timer position (`w:<sleepCalls>:<writes>`)
+  so post-resume writes can't be skipped against pre-timer chunks; live chunk
+  appends now fold into snapshot compaction (chunks previously vanished from
+  `getReadable` after ~200 steps).
+- **0.2.1** — `run.status` is a live getter (fresh promise per access).
+  entry-agents' startStopMonitor re-awaits it in a 150ms poll loop; a single
+  memoized promise left the monitor blocked until terminal.
+- **0.2.2** — `makeStep(fn, {retries})`: durable wrapper for arg-taking
+  step functions (entry's "use step" style).
+- **0.2.3–0.2.4** — packaging: explicit `types` in subpath exports,
+  declaration files emitted. No runtime change.
+- **0.2.5** — `rootDir: "src"` so the published `dist/` layout actually
+  matches the subpath export map (0.2.0–0.2.4 shipped `dist/src/...` while
+  exports claimed `dist/...` — subpath imports still worked because Node
+  resolved the package root, but the types were broken).
+- **0.2.6** — `export { workflowFetch as fetch }` (entry imports both
+  names), `WorkflowFn` accepts typed args, `run.exists: true`.
+
+### Spread notes
+
+Short-run spread across versions is ~2% (456–467 runs/s) — within run-to-run
+noise; the compat layer added no measurable overhead. 0.2.6 shows the best
+short-run numbers (494–525 runs/s across repeated runs) and the long-run
+8.3k–9.7k steps/s band matches the v0.1.4-era 9.9k within noise.
+
+## Reproducing
+
+Each version's tarball can be re-benchmarked independently:
+
+```bash
+npm pack lightflow-engine@<version>
+tar xzf lightflow-engine-<version>.tgz -C <dir> --strip-components=1
+ln -s <path-to>/lightflow/node_modules <dir>/node_modules
+PKG=<dir> LIGHTFLOW_PG_URL=postgres://... BENCH_N=200 RN=5 npx tsx bench-pkg.mts
+PKG=<dir> LIGHTFLOW_PG_URL=postgres://... BENCH_N=50 RN=400 npx tsx bench-pkg.mts
+```

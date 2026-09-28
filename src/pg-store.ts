@@ -174,6 +174,30 @@ export async function createPostgresStore(url: string): Promise<Store> {
     },
 
     async getEvents(runId) {
+      // Snapshot compaction: replay starts from the latest snapshot, not seq 0.
+      const snap = await pool.query(
+        `SELECT seq, payload FROM lightflow_events
+         WHERE run_id=$1 AND type='snapshot' ORDER BY seq DESC LIMIT 1`, [runId]);
+      if (snap.rowCount) {
+        const s = snap.rows[0];
+        const r = await pool.query(
+          `SELECT run_id, seq, type, payload, created_at FROM lightflow_events
+           WHERE run_id=$1 AND seq > $2 ORDER BY seq ASC`, [runId, s.seq]);
+        // Prepend the run_completed event so resume() can find name/args.
+        const start = await pool.query(
+          `SELECT payload FROM lightflow_events WHERE run_id=$1 AND seq=0`, [runId]);
+        const events = [{
+          runId, seq: 0, type: "run_completed",
+          payload: start.rows[0]?.payload ?? {}, createdAt: 0,
+        } as StepEvent, {
+          runId, seq: s.seq, type: "snapshot",
+          payload: s.payload, createdAt: 0,
+        } as StepEvent].concat(r.rows.map((x) => ({
+          runId: x.run_id, seq: x.seq, type: x.type,
+          payload: x.payload, createdAt: Number(x.created_at),
+        })) as StepEvent[]);
+        return events;
+      }
       const r = await pool.query(
         `SELECT run_id, seq, type, payload, created_at FROM lightflow_events
          WHERE run_id=$1 ORDER BY seq ASC`, [runId]);

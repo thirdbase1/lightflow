@@ -40,7 +40,7 @@ export type StepEvent = {
   runId: string;
   seq: number;
   type: "step_started" | "step_completed" | "step_failed" | "sleep_created" |
-        "sleep_completed" | "chunk" | "run_completed" | "run_failed";
+        "sleep_completed" | "chunk" | "run_completed" | "run_failed" | "snapshot";
   payload: unknown;
   createdAt: number;
 };
@@ -111,6 +111,10 @@ type Ctx = {
   log: StepEvent[];
   /** O(1) memo lookup: "type:key" -> event (built once at replay start) */
   memo: Map<string, StepEvent>;
+  /** steps completed during the current execution (for snapshot trigger) */
+  completedNow: number;
+  /** results of steps completed this execution: key -> value */
+  freshResults: Map<string, unknown>;
   /** index of events already consumed during replay */
   cursor: number;
   chunks: string[];
@@ -190,11 +194,44 @@ export async function step<T>(fn: () => Promise<T>): Promise<T> {
   }
 
   ctx.seq += 1;
+  ctx.freshResults.set(key, value);
   await ctx.store.appendEvent({
     runId: ctx.runId, seq: ctx.seq, type: "step_completed",
     payload: { key, value }, createdAt: ctx.now(),
   });
+  await maybeSnapshot(ctx);
   return value;
+}
+
+const SNAPSHOT_INTERVAL = 200;
+const SNAPSHOT_MIN_EVENTS = 100;
+
+/**
+ * History compaction: every SNAPSHOT_INTERVAL completed steps, fold the
+ * memoized step results (and completed sleeps) into a single 'snapshot'
+ * event. getEvents() replays from the latest snapshot, so old events stop
+ * costing replay time and can be pruned later without breaking resumes.
+ */
+async function maybeSnapshot(ctx: Ctx): Promise<void> {
+  ctx.completedNow += 1;
+  const done = ctx.completedNow +
+    [...ctx.memo.values()].filter((e) => e.type === "step_completed").length;
+  if (done < SNAPSHOT_MIN_EVENTS || done % SNAPSHOT_INTERVAL !== 0) return;
+  const memo: Record<string, unknown> = {};
+  for (const e of ctx.memo.values()) {
+    const key = (e.payload as { key?: string }).key;
+    if (key === undefined) continue;
+    if (e.type === "step_completed") memo[`step_completed:${key}`] = (e.payload as { value: unknown }).value;
+    else if (e.type === "sleep_completed") memo[`sleep_completed:${key}`] = true;
+    else if (e.type === "chunk") memo[`chunk:${key}`] = e.payload;
+  }
+  for (const [key, value] of ctx.freshResults) memo[`step_completed:${key}`] = value;
+  // include the step we just completed (not yet in ctx.memo)
+  ctx.seq += 1;
+  await ctx.store.appendEvent({
+    runId: ctx.runId, seq: ctx.seq, type: "snapshot",
+    payload: { memo }, createdAt: ctx.now(),
+  });
 }
 
 /** Durable sleep. Accepts milliseconds or an absolute Date. */
@@ -372,8 +409,25 @@ export class Engine {
 
     const log = await this.store.getEvents(runId);
     // Memo index: one pass over the log, O(1) lookups during replay.
+    // A leading 'snapshot' event pre-fills completed step/sleep/chunk state.
     const memo = new Map<string, StepEvent>();
     for (const e of log) {
+      if (e.type === "snapshot") {
+        const m = (e.payload as { memo?: Record<string, unknown> }).memo ?? {};
+        for (const [k, v] of Object.entries(m)) {
+          if (k.startsWith("step_completed:")) {
+            memo.set(k, { runId, seq: 0, type: "step_completed",
+              payload: { key: k.slice("step_completed:".length), value: v }, createdAt: 0 });
+          } else if (k.startsWith("sleep_completed:")) {
+            memo.set(k, { runId, seq: 0, type: "sleep_completed",
+              payload: { key: k.slice("sleep_completed:".length) }, createdAt: 0 });
+          } else if (k.startsWith("chunk:")) {
+            memo.set(k, { runId, seq: 0, type: "chunk",
+              payload: v as Record<string, unknown>, createdAt: 0 });
+          }
+        }
+        continue;
+      }
       const key = (e.payload as { key?: string }).key;
       if (key !== undefined && key !== null) memo.set(`${e.type}:${key}`, e);
     }
@@ -381,7 +435,7 @@ export class Engine {
       runId, seq: log.length ? log.reduce((m, e) => Math.max(m, e.seq), 0) + 1 : 1,
       stepCalls: 0, sleepCalls: 0, hookCalls: 0,
       writes: 0,
-      store: this.store, log, memo, cursor: 0, chunks: [], now: () => Date.now(),
+      store: this.store, log, memo, completedNow: 0, freshResults: new Map(), cursor: 0, chunks: [], now: () => Date.now(),
     };
 
     const prev = current;
@@ -447,7 +501,7 @@ export class Engine {
           // dueTimers() already excludes completed timers (anti-join), so no
           // per-timer getEvents round trip: complete directly and resume.
           await this.store.appendEvent({
-            runId: t.runId, seq: t.seq + 1_000_000, // collision-proof offset; ON CONFLICT handles races
+            runId: t.runId, seq: 0, // seq=0 forces slow path (collision) -> lock-allocated max+1
             type: "sleep_completed", payload: { key: t.key }, createdAt: Date.now(),
           });
           const row = await this.store.getRun(t.runId);

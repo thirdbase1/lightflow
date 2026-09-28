@@ -34,7 +34,7 @@ export class FatalError extends Error {
 /* Persistence interface (Postgres implementation below)               */
 /* ------------------------------------------------------------------ */
 
-export type RunStatus = "running" | "completed" | "failed";
+export type RunStatus = "running" | "completed" | "failed" | "cancelled";
 
 export type StepEvent = {
   runId: string;
@@ -147,12 +147,12 @@ export function getCurrent(): Ctx | null {
 function setCurrent(v: Ctx | null): void {
   (globalThis as { __lightflowCurrent?: Ctx | null }).__lightflowCurrent = v;
 }
-// Rewrite plain assignments on `current` below to setCurrent(...)
 
 
 export function getWorkflowMetadata(): { runId: string } {
-  if (!getCurrent()) throw new Error("getWorkflowMetadata() outside a workflow");
-  return { runId: getCurrent()!.runId };
+  const ctx = getCurrent();
+  if (!ctx) throw new Error("getWorkflowMetadata() outside a workflow");
+  return { runId: ctx.runId };
 }
 
 /* ------------------------------------------------------------------ */
@@ -160,8 +160,9 @@ export function getWorkflowMetadata(): { runId: string } {
 /* ------------------------------------------------------------------ */
 
 function nextStepKey(): string {
-  if (!getCurrent()) throw new Error("steps can only be called inside a workflow");
-  return `step:${getCurrent()!.stepCalls}`;
+  const ctx = getCurrent();
+  if (!ctx) throw new Error("steps can only be called inside a workflow");
+  return `step:${ctx.stepCalls}`;
 }
 
 /* ------------------------------------------------------------------ */
@@ -173,8 +174,8 @@ function nextStepKey(): string {
  * the function body is NOT re-executed.
  */
 export async function step<T>(fn: () => Promise<T>): Promise<T> {
-  if (!getCurrent()) return fn(); // plain call outside a workflow
-  const ctx = getCurrent()!;
+  const ctx = getCurrent();
+  if (!ctx) return fn(); // plain call outside a workflow
   const key = nextStepKey();
   ctx.stepCalls += 1;
 
@@ -264,11 +265,11 @@ async function maybeSnapshot(ctx: Ctx): Promise<void> {
 
 /** Durable sleep. Accepts milliseconds or an absolute Date. */
 export async function sleep(until: number | Date): Promise<void> {
-  if (!getCurrent()) {
+  const ctx = getCurrent();
+  if (!ctx) {
     const ms = until instanceof Date ? until.getTime() - Date.now() : until;
     return new Promise((r) => setTimeout(r, Math.max(0, ms)));
   }
-  const ctx = getCurrent()!;
   const wakeAt = until instanceof Date ? until.getTime() : ctx.now() + until;
   const key = `sleep:${ctx.sleepCalls}`;
   ctx.sleepCalls += 1;
@@ -294,8 +295,8 @@ export function getWritable<T = string>(): {
   write(chunk: T): Promise<void>;
   close(): Promise<void>;
 } {
-  const ctx = getCurrent()!;
-  if (!getCurrent()) throw new Error("getWritable() outside a workflow");
+  const ctx = getCurrent();
+  if (!ctx) throw new Error("getWritable() outside a workflow");
   return {
     async write(chunk: T) {
       // Memoized by deterministic call position: (sleep position, writes
@@ -386,8 +387,7 @@ export class Engine {
       getReadable: () => this.readable(runId),
       /** Entry calls this to kill a duplicate stream (route.ts:172). */
       cancel: async () => {
-        await this.store.cancel?.(runId);
-        await this.store.setStatus(runId, "failed", { error: "cancelled" });
+        await this.store.cancel?.(runId); // terminal: cancelled=true + status='cancelled'
       },
     };
   }
@@ -443,7 +443,7 @@ export class Engine {
     const claim = await claimer.claimRun?.(runId);
     if (claim && !claim.ok) return;
     if (claim?.cancelled) {
-      await this.store.setStatus(runId, "failed", { error: "cancelled" });
+      await this.store.setStatus(runId, "cancelled", { error: "cancelled" });
       return;
     }
 
@@ -509,6 +509,11 @@ export class Engine {
           err instanceof Error ? err : new Error(String(err)));
       };
       if (err instanceof CancelledError) return fail("cancelled");
+      if (await this.store.isCancelled?.(runId)) {
+        // A concurrent cancel() already wrote the terminal status — don't
+        // resurrect it as 'failed'.
+        return;
+      }
       if (err instanceof FatalError) return fail(err.message);
       return fail(err instanceof Error ? err.message : String(err));
     } finally {
@@ -635,11 +640,12 @@ export function defineHook<T = unknown>(): {
 } {
   return {
     async create() {
-      if (!getCurrent()) throw new Error("hooks only inside a workflow");
+      const ctx = getCurrent();
+      if (!ctx) throw new Error("hooks only inside a workflow");
       const token = `hook_${randomUUID().replace(/-/g, "").slice(0, 20)}`;
-      const key = `hook:${getCurrent()!.hookCalls}`;
-      getCurrent()!.hookCalls += 1;
-      await getCurrent()!.store.createHook?.(getCurrent()!.runId, token, key);
+      const key = `hook:${ctx.hookCalls}`;
+      ctx.hookCalls += 1;
+      await ctx.store.createHook?.(ctx.runId, token, key);
       return { token };
     },
   };
@@ -647,8 +653,9 @@ export function defineHook<T = unknown>(): {
 
 /** Await a previously created hook until an external caller resolves it. */
 export async function hookResult<T>(token: string): Promise<T> {
-  if (!getCurrent()) throw new Error("hooks only inside a workflow");
-  const existing = await getCurrent()!.store.getHook?.(token);
+  const ctx = getCurrent();
+  if (!ctx) throw new Error("hooks only inside a workflow");
+  const existing = await ctx.store.getHook?.(token);
   if (existing && (existing.payload as { resolved?: boolean })?.resolved) {
     return (existing.payload as { value: T }).value;
   }

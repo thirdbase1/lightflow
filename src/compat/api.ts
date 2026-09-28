@@ -70,6 +70,7 @@ function makeRunHandle(runId: string): VercelRun {
     const row = await store.getRun(runId);
     if (!row) return "pending";
     if (row.status === "completed") return "completed";
+    if (row.status === "cancelled") return "cancelled";
     if (row.status === "failed") {
       return (row.output as { error?: string } | null)?.error === "cancelled"
         ? "cancelled"

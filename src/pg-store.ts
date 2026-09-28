@@ -75,6 +75,10 @@ export async function createPostgresStore(
       created_at BIGINT NOT NULL
     );
   `);
+  // Stream chunk counter: O(1) nextChunkIndex without scanning all chunks.
+  await pool.query(`
+    ALTER TABLE lightflow_runs ADD COLUMN IF NOT EXISTS chunk_count INTEGER NOT NULL DEFAULT 0;
+  `);
   // Durable timers: expression index matching the dueTimers query exactly
   // (bigint cast on the payload value, partial on pending timers).
   await pool.query(`
@@ -260,10 +264,12 @@ export async function createPostgresStore(
 
     /** Terminal status + lease release in one round trip. */
     async finishRun(runId, status, output) {
+      // A cancelled run is terminal: the cancel path already wrote the final
+      // status, and a still-running replay must not resurrect it.
       await pool.query(
         `UPDATE lightflow_runs
          SET status=$2, output=$3, claimed_until=0, updated_at=$4
-         WHERE run_id=$1`,
+         WHERE run_id=$1 AND cancelled=false`,
         [runId, status, output === undefined ? null : JSON.stringify(output), Date.now()],
       );
     },
@@ -290,22 +296,31 @@ export async function createPostgresStore(
     },
 
     async nextChunkIndex(runId) {
+      // Atomic fetch-and-increment on the run row: O(1), race-free across
+      // replays (the chunk-key unique index still guards duplicates).
       const r = await pool.query(
-        `SELECT COALESCE(max((payload->>'index')::int),-1)+1 AS n
-         FROM lightflow_events WHERE run_id=$1 AND type='chunk'`, [runId]);
+        `UPDATE lightflow_runs SET chunk_count=chunk_count+1, updated_at=$2
+         WHERE run_id=$1 RETURNING chunk_count-1 AS n`, [runId, Date.now()]);
       return Number(r.rows[0].n);
     },
 
     async staleRuns(cutoff) {
+      // Only runs whose lease has EXPIRED are orphaned. A run inside a long
+      // (>staleMs) step still holds a live lease and must not be double-run.
       const r = await pool.query(
         `SELECT run_id FROM lightflow_runs
-         WHERE status='running' AND updated_at < $1`, [cutoff]);
+         WHERE status='running' AND updated_at < $1 AND claimed_until < $2`,
+        [cutoff, Date.now()]);
       return r.rows.map((x) => x.run_id as string);
     },
 
     async cancel(runId) {
+      // Terminal in one statement: flag + final status together, so a racing
+      // replay can never observe cancel-flag-without-terminal-status.
       await pool.query(
-        `UPDATE lightflow_runs SET cancelled=true, updated_at=$2 WHERE run_id=$1`,
+        `UPDATE lightflow_runs
+         SET cancelled=true, status='cancelled', output='{"error":"cancelled"}', claimed_until=0, updated_at=$2
+         WHERE run_id=$1`,
         [runId, Date.now()],
       );
     },

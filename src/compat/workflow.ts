@@ -60,10 +60,16 @@ export function getWritable<T = unknown>(): WritableStream<T> {
         (e) => e.type === "chunk" && (e.payload as { done?: boolean })?.done === true,
       );
       if (already) return;
+      // Monotonic chunk index — using ctx.writes here could collide with a
+      // real chunk's index and the unique-index no-op would silently drop
+      // the done marker (stream never terminates).
+      const index = await (ctx.store as unknown as {
+        nextChunkIndex(r: string): Promise<number>;
+      }).nextChunkIndex!(ctx.runId);
       ctx.seq += 1;
       ctx.append({
         runId: ctx.runId, seq: ctx.seq, type: "chunk",
-        payload: { value: null, done: true, key: "close", index: ctx.writes },
+        payload: { value: null, done: true, key: "close", index },
         createdAt: ctx.now(),
       });
     },

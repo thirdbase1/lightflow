@@ -33,22 +33,28 @@ export type VercelRun = {
   cancel(): Promise<void>;
 };
 
-let sharedEngine: Engine | null = null;
-let sharedStore: Store | null = null;
+// Cross-bundle singleton: Next.js loads instrumentation and route handlers as
+// separate module instances, so module-level state is NOT shared. Persisting
+// on globalThis makes the engine/store visible to every bundle in-process.
+type CompatGlobal = typeof globalThis & {
+  __lightflowCompat?: { engine: Engine | null; store: Store | null };
+};
+const g = globalThis as CompatGlobal;
+if (!g.__lightflowCompat) g.__lightflowCompat = { engine: null, store: null };
 
 /** Configure the compat layer with a store/engine (call once at boot). */
 export function initWorkflowApi(store: Store, engine?: Engine): void {
-  sharedStore = store;
-  sharedEngine = engine ?? new Engine(store);
+  g.__lightflowCompat!.store = store;
+  g.__lightflowCompat!.engine = engine ?? new Engine(store);
 }
 
 export function getEngine(): Engine {
-  if (!sharedEngine) {
+  if (!g.__lightflowCompat!.engine) {
     throw new Error(
       "workflow/api not initialized — call initWorkflowApi(store) at startup",
     );
   }
-  return sharedEngine;
+  return g.__lightflowCompat!.engine;
 }
 
 /**
@@ -57,7 +63,7 @@ export function getEngine(): Engine {
  */
 function makeRunHandle(runId: string): VercelRun {
   const engine = getEngine();
-  const store = sharedStore!;
+  const store = g.__lightflowCompat!.store!;
 
   /** One DB read -> Vercel status vocabulary. */
   const readStatus = async (): Promise<VercelRunStatus> => {

@@ -1,9 +1,10 @@
 /**
  * Vercel Workflow compat: getWorkflowMetadata() returns { workflowRunId }.
  */
-import { current } from "../index.js";
+import { getCurrent } from "../index.js";
 
 export function getWorkflowMetadata(): { workflowRunId: string } {
-  if (!current) throw new Error("getWorkflowMetadata() outside a workflow");
-  return { workflowRunId: current.runId };
+  const ctx = getCurrent();
+  if (!ctx) throw new Error("getWorkflowMetadata() outside a workflow");
+  return { workflowRunId: ctx.runId };
 }

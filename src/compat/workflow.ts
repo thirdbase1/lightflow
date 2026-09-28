@@ -15,7 +15,7 @@ import {
   step,
   registerStep,
 } from "../index.js";
-import { current } from "../index.js";
+import { getCurrent } from "../index.js";
 
 export { FatalError, CancelledError, sleep } from "../index.js";
 export { getWorkflowMetadata } from "../compat/metadata.js";
@@ -31,7 +31,7 @@ export { workflowFetch } from "../compat/fetch.js";
  * terminal done marker.
  */
 export function getWritable<T = unknown>(): WritableStream<T> {
-  const ctx = current;
+  const ctx = getCurrent();
   if (!ctx) throw new Error("getWritable() outside a workflow");
   const underlying = {
     async write(chunk: T) {

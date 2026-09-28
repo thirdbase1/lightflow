@@ -88,8 +88,18 @@ export interface Store {
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
  type WorkflowFn = (...args: any[]) => Promise<unknown>;
 
-const workflows = new Map<string, WorkflowFn>();
-const steps = new Map<string, (...a: unknown[]) => Promise<unknown>>();
+// Cross-bundle registries: Next.js bundles instrumentation and routes as
+// separate module instances; globalThis keeps workflow/step registrations
+// visible to whichever instance executes them.
+type RegistryGlobal = typeof globalThis & {
+  __lightflowWorkflows?: Map<string, WorkflowFn>;
+  __lightflowSteps?: Map<string, (...a: unknown[]) => Promise<unknown>>;
+};
+const reg = globalThis as RegistryGlobal;
+if (!reg.__lightflowWorkflows) reg.__lightflowWorkflows = new Map();
+if (!reg.__lightflowSteps) reg.__lightflowSteps = new Map();
+const workflows = reg.__lightflowWorkflows;
+const steps = reg.__lightflowSteps;
 
 export function registerWorkflow(id: string, fn: WorkflowFn): void {
   workflows.set(id, fn);
@@ -128,11 +138,21 @@ type Ctx = {
   now: () => number;
 };
 
-export let current: Ctx | null = null;
+// Cross-bundle execution context: Next.js may execute the engine and workflow
+// code from different module instances of this file. `current` must be visible
+// across all of them, so it lives on globalThis and is read via getCurrent().
+export function getCurrent(): Ctx | null {
+  return (globalThis as { __lightflowCurrent?: Ctx | null }).__lightflowCurrent ?? null;
+}
+function setCurrent(v: Ctx | null): void {
+  (globalThis as { __lightflowCurrent?: Ctx | null }).__lightflowCurrent = v;
+}
+// Rewrite plain assignments on `current` below to setCurrent(...)
+
 
 export function getWorkflowMetadata(): { runId: string } {
-  if (!current) throw new Error("getWorkflowMetadata() outside a workflow");
-  return { runId: current.runId };
+  if (!getCurrent()) throw new Error("getWorkflowMetadata() outside a workflow");
+  return { runId: getCurrent()!.runId };
 }
 
 /* ------------------------------------------------------------------ */
@@ -140,8 +160,8 @@ export function getWorkflowMetadata(): { runId: string } {
 /* ------------------------------------------------------------------ */
 
 function nextStepKey(): string {
-  if (!current) throw new Error("steps can only be called inside a workflow");
-  return `step:${current.stepCalls}`;
+  if (!getCurrent()) throw new Error("steps can only be called inside a workflow");
+  return `step:${getCurrent()!.stepCalls}`;
 }
 
 /* ------------------------------------------------------------------ */
@@ -153,8 +173,8 @@ function nextStepKey(): string {
  * the function body is NOT re-executed.
  */
 export async function step<T>(fn: () => Promise<T>): Promise<T> {
-  if (!current) return fn(); // plain call outside a workflow
-  const ctx = current;
+  if (!getCurrent()) return fn(); // plain call outside a workflow
+  const ctx = getCurrent()!;
   const key = nextStepKey();
   ctx.stepCalls += 1;
 
@@ -244,11 +264,11 @@ async function maybeSnapshot(ctx: Ctx): Promise<void> {
 
 /** Durable sleep. Accepts milliseconds or an absolute Date. */
 export async function sleep(until: number | Date): Promise<void> {
-  if (!current) {
+  if (!getCurrent()) {
     const ms = until instanceof Date ? until.getTime() - Date.now() : until;
     return new Promise((r) => setTimeout(r, Math.max(0, ms)));
   }
-  const ctx = current;
+  const ctx = getCurrent()!;
   const wakeAt = until instanceof Date ? until.getTime() : ctx.now() + until;
   const key = `sleep:${ctx.sleepCalls}`;
   ctx.sleepCalls += 1;
@@ -274,8 +294,8 @@ export function getWritable<T = string>(): {
   write(chunk: T): Promise<void>;
   close(): Promise<void>;
 } {
-  const ctx = current!;
-  if (!current) throw new Error("getWritable() outside a workflow");
+  const ctx = getCurrent()!;
+  if (!getCurrent()) throw new Error("getWritable() outside a workflow");
   return {
     async write(chunk: T) {
       // Memoized by deterministic call position: (sleep position, writes
@@ -466,8 +486,8 @@ export class Engine {
       },
     };
 
-    const prev = current;
-    current = ctx;
+    const prev = getCurrent();
+    setCurrent(ctx);
     try {
       const output = await fn(...args);
       await Promise.all(ctx.inflight);
@@ -492,7 +512,7 @@ export class Engine {
       if (err instanceof FatalError) return fail(err.message);
       return fail(err instanceof Error ? err.message : String(err));
     } finally {
-      current = prev;
+      setCurrent(prev);
       await claimer.releaseRun?.(runId);
     }
   }
@@ -615,11 +635,11 @@ export function defineHook<T = unknown>(): {
 } {
   return {
     async create() {
-      if (!current) throw new Error("hooks only inside a workflow");
+      if (!getCurrent()) throw new Error("hooks only inside a workflow");
       const token = `hook_${randomUUID().replace(/-/g, "").slice(0, 20)}`;
-      const key = `hook:${current.hookCalls}`;
-      current.hookCalls += 1;
-      await current.store.createHook?.(current.runId, token, key);
+      const key = `hook:${getCurrent()!.hookCalls}`;
+      getCurrent()!.hookCalls += 1;
+      await getCurrent()!.store.createHook?.(getCurrent()!.runId, token, key);
       return { token };
     },
   };
@@ -627,8 +647,8 @@ export function defineHook<T = unknown>(): {
 
 /** Await a previously created hook until an external caller resolves it. */
 export async function hookResult<T>(token: string): Promise<T> {
-  if (!current) throw new Error("hooks only inside a workflow");
-  const existing = await current.store.getHook?.(token);
+  if (!getCurrent()) throw new Error("hooks only inside a workflow");
+  const existing = await getCurrent()!.store.getHook?.(token);
   if (existing && (existing.payload as { resolved?: boolean })?.resolved) {
     return (existing.payload as { value: T }).value;
   }

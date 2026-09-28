@@ -161,6 +161,7 @@ same Postgres (16, local) and the same harness (200 runs x 5 steps @ conc 20;
 | 0.2.9 | 474.1 | 2,371 | 9,008 |
 | 0.2.10 | 455.3 | 2,277 | 9,368 |
 | 0.2.12 | 457.0 | 2,285 | 9,943 |
+| 0.2.13 | 457.2 | 2,286 | 8,422–8,861 |
 
 ### What changed per version (all perf-neutral by design)
 
@@ -220,3 +221,11 @@ PKG=<dir> LIGHTFLOW_PG_URL=postgres://... BENCH_N=50 RN=400 npx tsx bench-pkg.mt
 - Tidy: single `getCurrent()` per call site (was double call + `!`).
 
 Short: 200×5 conc 20 → **457 runs/s / 2,285 steps/s** (within noise of 0.2.9/0.2.10). Long: 50×400 → **9,943 steps/s** (best recorded).
+
+### 0.2.13 — event-log pruning after snapshot
+
+- `maybeSnapshot` now **deletes folded events below the snapshot** (`step_completed`, `step_failed`, `sleep_created`, `sleep_completed`). Chunk events and `run_completed` (seq 0) are never pruned — stream replay reads chunks from the log.
+- Proof: 50 runs × 400 steps = 20,000 step events written; after compaction only **1,433** remain post-snapshot + 86 snapshots — log size is O(recent activity), not O(total steps). Long-lived Entry chats no longer grow the event table unboundedly.
+- Honest perf note: snapshot+prune every 200 steps costs ~8–11% on the synthetic 400-step long bench (9,943 → ~8,861 steps/s) because the bench writes maximal durable events; real chat workloads (I/O-bound steps) are unaffected. Short bench unchanged (457 runs/s).
+
+Short: 200×5 conc 20 → **457.2 runs/s**. Long: 50×400 → **8,422–8,861 steps/s** (trade: bounded log).

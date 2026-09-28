@@ -82,6 +82,32 @@ debt", PgQue's notify pattern, and Absurd's minimal-query design, then:
 
 ---
 
+## v0.1.3 — compaction & client round
+
+**Focus: replay-from-scratch cost, client overhead, polling waste.**
+
+- **Snapshot compaction** (the Temporal `ContinueAsNew` problem, designed out):
+  every 200 completed steps, memoized state folds into a single `snapshot`
+  event; replay resumes from the latest snapshot instead of seq 0. A 700-step
+  run mid-way through sleeps and resumes correctly through snapshots.
+- **pg pipelining** (`pg >= 8.23`, one option): queries batch per connection —
+  biggest wins under concurrency and on networked Postgres.
+- **Zero-poll `returnValue`**: in-process callers await a deferred promise;
+  the DB is only polled by cross-process callers (adaptive 5→250 ms).
+
+| Metric | v0.1.2 | v0.1.3 |
+|---|---|---|
+| Runs / sec, 500×10 @ conc 100 | — | **497** |
+| Steps / sec, 400-step workflows | 9,070 | 8,956–10,658* |
+| Steps / sec, 600-step workflows | — | 10,055 |
+| `returnValue` DB polls (same process) | every 5–250 ms | **0** |
+| Replay cost for an old run | O(total events) | O(events since snapshot) |
+
+\* range across runs; the long-workflow number varies with how many
+snapshots land before each resume.
+
+---
+
 ## Reproducing
 
 `test/bench.ts` honours `BENCH_N` (runs), `BENCH_M` (steps per run),

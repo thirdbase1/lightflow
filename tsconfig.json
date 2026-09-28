@@ -3,6 +3,7 @@
     "module": "nodenext",
     "moduleResolution": "nodenext",
     "target": "es2022",
+    "rootDir": "src",
     "outDir": "dist",
     "strict": true,
     "types": ["node"],
@@ -10,5 +11,5 @@
     "esModuleInterop": true,
     "declaration": true
   },
-  "include": ["src/**/*.ts", "test/**/*.ts"]
+  "include": ["src/**/*.ts"]
 }

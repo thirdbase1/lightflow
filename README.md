@@ -149,6 +149,45 @@ Kill-and-resume is a first-class path, not an edge case. The engine includes a
 **reaper** that resumes runs wedged in `running` — a failure mode we hit in
 other engines and designed out here.
 
+## Benchmarks
+
+Throughput measured with [`test/bench.ts`](test/bench.ts) — plain `node`
+against a local Postgres 16, no network hop. Run it yourself:
+
+```bash
+npm run build
+LIGHTFLOW_PG_URL=postgres://... node dist/test/bench.js
+```
+
+### v0.1.0 → v0.1.1 (before / after)
+
+Same machine, same workload (200 runs × 5 steps, 20 in flight):
+
+| | v0.1.0 | v0.1.1 | |
+|---|---|---|---|
+| Runs / sec | 184 | 456–556 | **~2.7× faster** |
+| Steps / sec | 922 | ~2,300–2,800 | **~2.7× faster** |
+| SQL statements per event | 5 (BEGIN, advisory lock, max(seq), INSERT, COMMIT) | 1 (single INSERT … ON CONFLICT) | −80% |
+| Advisory lock in hot path | every event, 7.8ms avg | removed | — |
+| Racing resumes double-executing a step | possible (latent) | impossible (run lease) | fixed |
+
+Sustained load, v0.1.1 (500 runs × 10 steps, 100 in flight):
+**445 runs/sec, 4,450 steps/sec.**
+
+What changed in v0.1.1, and why it matters:
+
+- **Single-statement event append.** The old path took an advisory lock and
+  scanned `max(seq)` per event; profiling showed the lock averaging 7.8ms —
+  40× the cost of any other query. The new path relies on the `(run_id, seq)`
+  unique constraint and a single upsert.
+- **Run lease.** Concurrent `resume()` calls for the same run are arbitrated
+  by an atomic `claimed_until` column, so two replays can never execute the
+  same step at once (verified by `test/race.ts`: 20 racing resumes × 10 runs,
+  zero double-executions).
+- **No `step_started` writes** (replay never reads them), stream writes use
+  the in-memory replay log instead of re-fetching the event log, `createRun`
+  is one round trip, and `getRun().returnValue` polls adaptively (5ms → 250ms).
+
 ## Design decisions
 
 - **All timestamps are BIGINT epoch milliseconds.** No `timestamptz`, no

@@ -140,3 +140,19 @@ sequential-ish workflows through `start()` + terminal-poll.
 
 Every version's table above was produced on the same machine and database,
 so cross-version rows are directly comparable.
+
+## v0.2.0 — compat layer (perf-neutral)
+
+Focus: Vercel Workflow drop-in compat (`lightflow-engine/compat/*`).
+No perf regression vs v0.1.4 — two real bugs found and fixed along the way:
+post-resume chunk loss (chunk keys now include the durable-timer position)
+and chunks vanishing from streams after snapshot compaction (live chunks
+now fold into snapshots).
+
+| Scenario | v0.1.4 | v0.2.0 |
+|---|---|---|
+| 200 runs x 5 steps, conc 20 (runs/s) | 502–512 | 504.5 |
+| 50 runs x 400 steps durable (steps/s) | 9,939 | 9,062–10,600 |
+
+Verdict: perf-neutral within noise. Compat test (7/7) exercises the full
+entry-agents surface end-to-end.

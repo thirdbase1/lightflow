@@ -127,7 +127,7 @@ type Ctx = {
   now: () => number;
 };
 
-let current: Ctx | null = null;
+export let current: Ctx | null = null;
 
 export function getWorkflowMetadata(): { runId: string } {
   if (!current) throw new Error("getWorkflowMetadata() outside a workflow");
@@ -275,13 +275,12 @@ export function getWritable<T = string>(): {
 } {
   const ctx = current!;
   if (!current) throw new Error("getWritable() outside a workflow");
-  /** Deterministic key: (durable-timer position, writes since it). */
-  const keyFor = () => `${ctx.sleepCalls}:${ctx.writes}`;
   return {
     async write(chunk: T) {
-      // Memoized by call position (like steps): on replay, a write whose
-      // position was already emitted is skipped, and the loop advances.
-      const key = `w:${ctx.writes}`;
+      // Memoized by deterministic call position: (sleep position, writes
+      // since it). sleepCalls survives a resume so a post-timer write can
+      // never collide with (and be skipped against) a pre-timer chunk.
+      const key = `w:${ctx.sleepCalls}:${ctx.writes}`;
       // Use the replay memo — no per-write re-fetch of the event log.
       const already = ctx.memo.has(`chunk:${key}`);
       ctx.writes += 1;
@@ -290,10 +289,14 @@ export function getWritable<T = string>(): {
         nextChunkIndex(r: string): Promise<number>;
       }).nextChunkIndex!(ctx.runId);
       ctx.seq += 1;
+      const payload = { value: chunk, index, key };
       await ctx.store.appendEvent({
         runId: ctx.runId, seq: ctx.seq, type: "chunk",
-        payload: { value: chunk, index, key }, createdAt: ctx.now(),
+        payload, createdAt: ctx.now(),
       });
+      // Record in the live memo so snapshot compaction folds it.
+      ctx.memo.set(`chunk:${key}`, { runId: ctx.runId, seq: ctx.seq,
+        type: "chunk", payload, createdAt: ctx.now() });
     },
     async close() {
       const already = [...ctx.memo.values()].some(

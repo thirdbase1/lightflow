@@ -149,6 +149,27 @@ Kill-and-resume is a first-class path, not an edge case. The engine includes a
 **reaper** that resumes runs wedged in `running` — a failure mode we hit in
 other engines and designed out here.
 
+## Vercel Workflow drop-in compat
+
+lightflow ships a compatibility layer mirroring the exact Vercel Workflow
+API surface (`start(fn, args)`, sync `getRun()`, `run.status` Promise,
+`run.getReadable({ startIndex })` + `getTailIndex()`, `run.cancel()`,
+`run.returnValue`, `getWritable()` as a web `WritableStream`,
+`getWorkflowMetadata()`, `sleep(Date)`, `FatalError`, `withWorkflow`).
+See [COMPAT.md](./COMPAT.md) for the 3-step swap guide and honest
+differences list.
+
+```ts
+import { createPostgresStore } from "lightflow-engine/pg";
+import { Engine } from "lightflow-engine";
+import { initWorkflowApi } from "lightflow-engine/compat/api";
+
+const store = await createPostgresStore(process.env.LIGHTFLOW_PG_URL!);
+const engine = new Engine(store, { pollMs: 50 });
+await engine.startWorker();
+initWorkflowApi(store, engine);
+```
+
 ## Benchmarks
 
 Full before/after numbers for every version live in [BENCHMARKS.md](BENCHMARKS.md).

@@ -60,13 +60,18 @@ export async function createPostgresStore(url: string): Promise<Store> {
       ON lightflow_events ((payload->>'wakeAt'))
       WHERE type = 'sleep_created';
   `);
-  // Exactly-once chunks: one row per (run, write index). The appendEvent for
-  // chunks passes index in payload; this turns a write-race duplicate into a
-  // harmless no-op.
+  // Exactly-once chunks: one row per (run, write index) AND one per (run,
+  // call-position key). The key index is what makes a replayed write a
+  // harmless no-op even when two replays race.
   await pool.query(`
     CREATE UNIQUE INDEX IF NOT EXISTS lightflow_events_chunk_unique
       ON lightflow_events (run_id, (payload->>'index'))
       WHERE type = 'chunk';
+  `);
+  await pool.query(`
+    CREATE UNIQUE INDEX IF NOT EXISTS lightflow_events_chunk_key_unique
+      ON lightflow_events (run_id, (payload->>'key'))
+      WHERE type = 'chunk' AND payload->>'key' IS NOT NULL;
   `);
 
 
@@ -94,12 +99,20 @@ export async function createPostgresStore(url: string): Promise<Store> {
 
     async appendEvent(e: StepEvent) {
       if (e.type === "chunk") {
-        // Exactly-once by write index; seq is allocated atomically to avoid
-        // (run_id, seq) collisions between concurrent replays.
+        // Exactly-once by write key, decided INSIDE the advisory lock so two
+        // racing replays cannot both pass the check-then-insert window.
         const c = await pool.connect();
         try {
           await c.query("BEGIN");
           await c.query("SELECT pg_advisory_xact_lock(hashtext($1))", [e.runId]);
+          const key = (e.payload as { key?: string }).key;
+          if (key) {
+            const dup = await c.query(
+              `SELECT 1 FROM lightflow_events
+               WHERE run_id=$1 AND type='chunk' AND payload->>'key'=$2 LIMIT 1`,
+              [e.runId, key]);
+            if (dup.rowCount) { await c.query("COMMIT"); return; }
+          }
           const r = await c.query(
             `SELECT COALESCE(max(seq),-1)+1 AS seq FROM lightflow_events WHERE run_id=$1`,
             [e.runId]);
@@ -112,7 +125,7 @@ export async function createPostgresStore(url: string): Promise<Store> {
         } catch (err) {
           await c.query("ROLLBACK").catch(() => {});
           const msg = err instanceof Error ? err.message : String(err);
-          if (!/duplicate key value.*chunk_unique/.test(msg)) throw err;
+          if (!/duplicate key value/.test(msg)) throw err;
           // duplicate chunk from a replayed tick: expected, ignore
         } finally { c.release(); }
         return;

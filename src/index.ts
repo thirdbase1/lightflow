@@ -272,7 +272,25 @@ export function getWritable<T = string>(): {
 
 const DEFAULT_STEP_RETRIES = 3;
 
+type Deferred = {
+  promise: Promise<unknown>;
+  resolve(v: unknown): void;
+  reject(e: unknown): void;
+};
+
 export class Engine {
+  /** In-process run completions: runId -> deferred. Avoids polling entirely. */
+  private readonly local = new Map<string, Deferred>();
+
+  private defer(runId: string): Deferred {
+    let resolve!: (v: unknown) => void;
+    let reject!: (e: unknown) => void;
+    const promise = new Promise<unknown>((res, rej) => { resolve = res; reject = rej; });
+    const d = { promise, resolve, reject };
+    this.local.set(runId, d);
+    return d;
+  }
+
   constructor(
     private readonly store: Store,
     private readonly opts: { stepRetries?: number; pollMs?: number; staleRunMs?: number } = {},
@@ -281,6 +299,7 @@ export class Engine {
   async start(workflowId: string, args: unknown[]): Promise<{ runId: string }> {
     const runId = `lrun_${randomUUID().replace(/-/g, "").slice(0, 24)}`;
     await this.store.createRun(runId, workflowId, args);
+    this.defer(runId);
     void this.run(runId, workflowId, args);
     return { runId };
   }
@@ -302,9 +321,12 @@ export class Engine {
   }
 
   private async waitFor(runId: string): Promise<unknown> {
+    // In-process fast path: if this engine instance started the run, await
+    // the deferred promise directly — no database polling at all.
+    const d = this.local.get(runId);
+    if (d) return d.promise;
+    // Cross-process fallback: adaptive poll (5ms -> 250ms).
     const deadline = Date.now() + 10 * 60_000;
-    // Adaptive poll: fast at first (most runs finish in ms), backing off so
-    // long waits don't hammer the database.
     let delay = 5;
     while (Date.now() < deadline) {
       const row = await this.store.getRun(runId);
@@ -371,19 +393,19 @@ export class Engine {
       }
       const output = await fn(...args);
       await this.store.setStatus(runId, "completed", output);
+      this.local.get(runId)?.resolve(output);
     } catch (err) {
       if (err instanceof SuspendSignal) return; // waiting on a timer
-      if (err instanceof CancelledError) {
-        await this.store.setStatus(runId, "failed", { error: "cancelled" });
-        return;
-      }
-      if (err instanceof FatalError) {
-        await this.store.setStatus(runId, "failed", { error: err.message });
-        return;
-      }
-      await this.store.setStatus(runId, "failed", {
-        error: err instanceof Error ? err.message : String(err),
-      });
+      const fail = async (error: unknown) => {
+        await this.store.setStatus(runId, "failed", {
+          error: error instanceof Error ? error.message : String(error),
+        });
+        this.local.get(runId)?.reject(
+          err instanceof Error ? err : new Error(String(err)));
+      };
+      if (err instanceof CancelledError) return fail("cancelled");
+      if (err instanceof FatalError) return fail(err.message);
+      return fail(err instanceof Error ? err.message : String(err));
     } finally {
       current = prev;
       await claimer.releaseRun?.(runId);

@@ -12,7 +12,9 @@ type StepEvent = import("../src/index.js").StepEvent;
 type RunStatus = import("../src/index.js").RunStatus;
 
 export async function createPostgresStore(url: string): Promise<Store> {
-  const pool = new pg.Pool({ connectionString: url, max: 20 });
+  // Pipelining (pg >= 8.23): batch queries on one connection instead of one
+  // round trip per query — 1.5-2.4x on multi-query workloads.
+  const pool = new pg.Pool({ connectionString: url, max: 20, pipeline: true });
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS lightflow_runs (

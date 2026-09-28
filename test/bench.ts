@@ -38,7 +38,8 @@ async function main() {
     while (queue.length) {
       const i = queue.shift()!;
       const { runId } = await engine.start("bench", []);
-      let run; do { await new Promise(r=>setTimeout(r,20)); run = await store.getRun(runId); } while (run && run.status==="running");
+      const run = await engine.getRun(runId);
+      await run.returnValue;
       done++;
     }
   }

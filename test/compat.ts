@@ -60,7 +60,8 @@ test("compat: vercel-style agent chat workflow end-to-end", async () => {
   ]);
   assert.ok(run.runId.startsWith("lrun_"));
 
-  // status is a Promise, resolvable to a terminal state
+  // status is a live getter; await terminal state via returnValue
+  await run.returnValue;
   const status = await run.status;
   assert.equal(status, "completed");
   const ret = (await run.returnValue) as { workflowRunId: string; answer: string };
@@ -89,7 +90,8 @@ test("compat: vercel-style agent chat workflow end-to-end", async () => {
   // cancel semantics: getRun + status + cancel()
   const dup = await start(runAgentWorkflow, [{ messages: ["x"], chatId: "c2" }]);
   await dup.cancel();
-  assert.equal(await dup.status, "cancelled");
+  assert.equal(await dup.status, "cancelled");  // live getter reflects cancel
+
 
   await pool.end();
   engine.stopWorker();

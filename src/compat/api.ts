@@ -19,6 +19,10 @@ export type VercelRunStatus =
 
 export type VercelRun = {
   runId: string;
+  /** Live getter: each access returns a FRESH promise snapshotting the
+   *  current status ("pending"/"running" until terminal). Vercel's is a
+   *  getter too (chat.test.ts mocks `get status()`), and entry-agents'
+   *  startStopMonitor re-awaits it in a 150ms poll loop. */
   readonly status: Promise<VercelRunStatus>;
   returnValue: Promise<unknown>;
   getReadable<T = unknown>(opts?: { startIndex?: number }): ReadableStream<T> & {
@@ -49,54 +53,57 @@ export function getEngine(): Engine {
  * Register a workflow function under a stable id and start it. Mirrors
  * Vercel's start(workflowFn, args).
  */
-export async function start(
-  fn: (...args: never[]) => Promise<unknown>,
-  args: unknown[],
-): Promise<VercelRun> {
-  const engine = getEngine();
-  const id = workflowIdFor(fn as (...a: unknown[]) => Promise<unknown>);
-  registerWorkflow(id, fn as (...a: unknown[]) => Promise<unknown>);
-  const { runId } = await engine.start(id, args);
-  return makeRunHandle(runId);
-}
-
-export function getRun(runId: string): VercelRun {
-  return makeRunHandle(runId);
-}
-
 function makeRunHandle(runId: string): VercelRun {
   const engine = getEngine();
   const store = sharedStore!;
-  let cachedStatus: VercelRunStatus | null = null;
 
-  const statusPromise: Promise<VercelRunStatus> = (async () => {
-    if (cachedStatus) return cachedStatus;
-    const deadline = Date.now() + 10 * 60_000;
-    let delay = 5;
-    let seenRow = false;
-    while (Date.now() < deadline) {
-      const row = await store.getRun(runId);
-      if (row) {
-        seenRow = true;
-        if (row.status === "completed") { cachedStatus = "completed"; return cachedStatus; }
-        if (row.status === "failed") {
-          // cancelled runs are 'failed' with error 'cancelled'
-          cachedStatus =
-            (row.output as { error?: string } | null)?.error === "cancelled"
-              ? "cancelled" : "failed";
-          return cachedStatus;
-        }
-      }
-      await new Promise((r) => setTimeout(r, delay));
-      delay = seenRow ? Math.min(delay * 1.6, 250) : 5;
+  /** One DB read -> Vercel status vocabulary. */
+  const readStatus = async (): Promise<VercelRunStatus> => {
+    const row = await store.getRun(runId);
+    if (!row) return "pending";
+    if (row.status === "completed") return "completed";
+    if (row.status === "failed") {
+      return (row.output as { error?: string } | null)?.error === "cancelled"
+        ? "cancelled"
+        : "failed";
     }
-    throw new Error(`run status timeout: ${runId}`);
-  })();
+    return "running";
+  };
 
+  /** Promise resolving when the run reaches a terminal state. */
+  const terminal = (cache: { status?: VercelRunStatus }): Promise<VercelRunStatus> => {
+    const deadline = Date.now() + 10 * 60_000;
+    let delay = 25;
+    const loop = async (): Promise<VercelRunStatus> => {
+      while (Date.now() < deadline) {
+        const st = await readStatus();
+        if (st === "completed" || st === "failed" || st === "cancelled") {
+          cache.status = st;
+          return st;
+        }
+        await new Promise((r) => setTimeout(r, delay));
+        delay = Math.min(delay * 1.4, 250);
+      }
+      throw new Error(`run status timeout: ${runId}`);
+    };
+    return loop();
+  };
+
+  const cache: { status?: VercelRunStatus } = {};
   const handle: VercelRun = {
     runId,
-    status: statusPromise,
-    returnValue: (async () => (await engine.getRun(runId)).returnValue)(),
+    get status() {
+      // Live snapshot: resolve immediately with the current state; the
+      // startStopMonitor poll loop relies on this re-reading each tick.
+      return readStatus().then((st) => {
+        cache.status = st;
+        return st;
+      });
+    },
+    returnValue: (async () => {
+      await terminal(cache);
+      return (await engine.getRun(runId)).returnValue;
+    })(),
     getReadable<T>(opts?: { startIndex?: number }) {
       const startIndex = opts?.startIndex ?? 0;
       let sent = startIndex;
@@ -129,14 +136,12 @@ function makeRunHandle(runId: string): VercelRun {
           if (closed) { controller.close(); return; }
           const chunks = await collectChunks();
           const hasDone = chunks.some((c) => c.done);
-          // chunks carry a monotonic `index`; entries after startIndex
           for (const c of chunks) {
-            const p = c as { value: unknown; done?: boolean; index: number };
-            if (p.done) { closed = true; controller.close(); return; }
-            if (p.index < startIndex) continue;
-            if (p.index >= sent) {
-              controller.enqueue(p.value as T);
-              sent = p.index + 1;
+            if (c.done) { closed = true; controller.close(); return; }
+            if (c.index < startIndex) continue;
+            if (c.index >= sent) {
+              controller.enqueue(c.value as T);
+              sent = c.index + 1;
             }
           }
           if (hasDone) { closed = true; controller.close(); return; }
@@ -163,3 +168,19 @@ function makeRunHandle(runId: string): VercelRun {
   };
   return handle;
 }
+
+export async function start(
+  fn: (...args: never[]) => Promise<unknown>,
+  args: unknown[],
+): Promise<VercelRun> {
+  const engine = getEngine();
+  const id = workflowIdFor(fn as (...a: unknown[]) => Promise<unknown>);
+  registerWorkflow(id, fn as (...a: unknown[]) => Promise<unknown>);
+  const { runId } = await engine.start(id, args);
+  return makeRunHandle(runId);
+}
+
+export function getRun(runId: string): VercelRun {
+  return makeRunHandle(runId);
+}
+

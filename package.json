@@ -35,8 +35,8 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/agentuser/lightflow.git"
+    "url": "git+https://github.com/thirdbase1/lightflow.git"
   },
-  "bugs": { "url": "https://github.com/agentuser/lightflow/issues" },
-  "homepage": "https://github.com/agentuser/lightflow#readme"
+  "bugs": { "url": "https://github.com/thirdbase1/lightflow/issues" },
+  "homepage": "https://github.com/thirdbase1/lightflow#readme"
 }

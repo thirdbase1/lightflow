@@ -60,6 +60,7 @@ export interface Store {
   isCancelled?(runId: string): Promise<boolean>;
   /** Next monotonic chunk index (max+1), atomic per run. */
   nextChunkIndex?(runId: string): Promise<number>;
+  pruneEvents?(runId: string, beforeSeq: number): Promise<void>;
   /** Run lease: claim (atomically) / release before executing a replay. */
   claimRun?(runId: string, leaseMs?: number): Promise<{ ok: boolean; cancelled: boolean }>;
   releaseRun?(runId: string): Promise<void>;
@@ -261,6 +262,10 @@ async function maybeSnapshot(ctx: Ctx): Promise<void> {
     runId: ctx.runId, seq: ctx.seq, type: "snapshot",
     payload: { memo }, createdAt: ctx.now(),
   });
+  // Folded events below the snapshot are dead weight — drop them so the log
+  // stays O(recent activity), not O(total steps). Chunks are kept (stream
+  // replay reads them); run_completed (seq 0) is protected by beforeSeq > 0.
+  await ctx.store.pruneEvents?.(ctx.runId, ctx.seq - 1);
 }
 
 /** Durable sleep. Accepts milliseconds or an absolute Date. */

@@ -356,6 +356,19 @@ export async function createPostgresStore(
       };
     },
 
+    async pruneEvents(runId, beforeSeq) {
+      // Remove events fully folded into the latest snapshot. Chunk events are
+      // KEPT: getReadable/getTailIndex stream chunks from the event log, and
+      // the snapshot memo is not a chunk source. run_completed (seq 0) is
+      // protected by beforeSeq > 0.
+      await pool.query(
+        `DELETE FROM lightflow_events
+         WHERE run_id=$1 AND seq < $2
+           AND type IN ('step_completed','step_failed','sleep_created','sleep_completed')`,
+        [runId, beforeSeq],
+      );
+    },
+
     async setStatus(runId, status, output) {
       await pool.query(
         `UPDATE lightflow_runs SET status=$2, output=$3, updated_at=$4 WHERE run_id=$1`,

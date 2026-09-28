@@ -16,7 +16,9 @@ the work must continue correctly — background jobs, agent loops, billing
 pipelines, sandbox lifecycle management — you've had to choose between:
 
 - **Temporal / Cadence**: extremely powerful, extremely heavy to operate
-- **Vercel Workflow / Inngest**: excellent, but tied to their platform
+- **Vercel Workflow / Inngest**: excellent — Vercel Workflow is open source
+  (Apache-2.0) and self-hostable via `@workflow/world-postgres`; lightflow
+  trades its adapter/SDK surface for a single engine you can read end-to-end
 - **BullMQ / plain queues**: a queue is not durable execution — one crash and
   you re-run side effects (and re-charge your LLM provider)
 
@@ -165,9 +167,13 @@ other engines and designed out here.
 | Durable steps | ✅ | ✅ | ✅ | ❌ |
 | Durable timers | ✅ | ✅ | ✅ | delayed jobs |
 | Replayable streams | ✅ | ❌ | ✅ | ❌ |
-| Self-host in an afternoon | ✅ | ❌ (cluster) | ❌ (platform) | ✅ |
-| Dependencies | 1 (`pg`) | many | platform | redis |
-| Lines of core code | ~700 | 100k+ | platform | ~10k |
+| Dependencies | 1 (`pg`) | many | multi-package | redis |
+| Lines of core code | ~700 | 100k+ | large monorepo | ~10k |
+
+Vercel Workflow is itself open source (Apache-2.0) and self-hostable via its
+Postgres world (`@workflow/world-postgres`) — lightflow is the alternative for
+when you want a single small engine you can read end-to-end, not an SDK with
+an adapter system.
 
 ## Status
 

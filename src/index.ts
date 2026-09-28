@@ -245,11 +245,6 @@ export function getWritable<T = string>(): {
         runId: ctx.runId, seq: ctx.seq, type: "chunk",
         payload: { value: chunk, index, key }, createdAt: ctx.now(),
       });
-      ctx.seq += 1;
-      await ctx.store.appendEvent({
-        runId: ctx.runId, seq: ctx.seq, type: "chunk",
-        payload: { value: chunk, index }, createdAt: ctx.now(),
-      });
     },
     async close() {
       const already = ctx.log.some(
@@ -372,9 +367,17 @@ export class Engine {
     }
   }
 
-  /** Worker loop: resume runs whose timers are due. */
+  private workerStopped = false;
+
+  /** Signal the worker loop to exit after its current poll cycle. */
+  stopWorker(): void {
+    this.workerStopped = true;
+  }
+
+  /** Worker loop: resume runs whose timers are due. Resolves when stopWorker() is called. */
   async startWorker(onError?: (e: unknown) => void): Promise<void> {
-    for (;;) {
+    this.workerStopped = false;
+    while (!this.workerStopped) {
       try {
         const due = await this.store.dueTimers(Date.now());
         for (const t of due) {

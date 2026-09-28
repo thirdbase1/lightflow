@@ -60,9 +60,11 @@ export async function createPostgresStore(url: string): Promise<Store> {
       created_at BIGINT NOT NULL
     );
   `);
+  // Durable timers: expression index matching the dueTimers query exactly
+  // (bigint cast on the payload value, partial on pending timers).
   await pool.query(`
     CREATE INDEX IF NOT EXISTS lightflow_events_timer_idx
-      ON lightflow_events ((payload->>'wakeAt'))
+      ON lightflow_events (((payload->>'wakeAt')::bigint))
       WHERE type = 'sleep_created';
   `);
   // Exactly-once chunks: one row per (run, write index) AND one per (run,
@@ -180,10 +182,20 @@ export async function createPostgresStore(url: string): Promise<Store> {
     },
 
     async dueTimers(now) {
+      // Only timers not yet completed (anti-join against sleep_completed by
+      // payload key). Paired with claimDue() so racing workers don't wake the
+      // same timer twice.
       const r = await pool.query(
-        `SELECT run_id, seq FROM lightflow_events
-         WHERE type='sleep_created' AND (payload->>'wakeAt')::bigint <= $1`, [now]);
-      return r.rows.map((x) => ({ runId: x.run_id, seq: x.seq }));
+        `SELECT e.run_id, e.seq, e.payload->>'key' AS key FROM lightflow_events e
+         WHERE e.type='sleep_created'
+           AND (e.payload->>'wakeAt')::bigint <= $1
+           AND NOT EXISTS (
+             SELECT 1 FROM lightflow_events c
+             WHERE c.run_id = e.run_id AND c.type='sleep_completed'
+               AND c.payload->>'key' = e.payload->>'key'
+           )
+         LIMIT 100`, [now]);
+      return r.rows.map((x) => ({ runId: x.run_id, seq: x.seq, key: x.key }));
     },
 
     async claimDue() { return false; },
@@ -204,6 +216,27 @@ export async function createPostgresStore(url: string): Promise<Store> {
         `UPDATE lightflow_runs SET claimed_until=0 WHERE run_id=$1 AND claimed_until > 0`,
         [runId],
       );
+    },
+
+    /** LISTEN/NOTIFY wakeup support: re-poll immediately on notify. */
+    async notifyWake() {
+      await pool.query(`NOTIFY lightflow_wake`);
+    },
+
+    getListenClient() {
+      const client = new pg.Client({ connectionString: url });
+      const ready = client.connect().then(() => {
+        // A listening client must not keep the Node process alive on its own.
+        (client as unknown as { stream?: { unref?(): void } }).stream?.unref?.();
+        return client;
+      });
+      return {
+        async query(sql: string) { return (await ready).query(sql); },
+        on(_event: "notification", cb: () => void) {
+          void ready.then((c) => c.on("notification", cb));
+        },
+        release() { void ready.then((c) => c.end()).catch(() => {}); },
+      };
     },
 
     async nextChunkIndex(runId) {

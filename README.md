@@ -159,7 +159,34 @@ npm run build
 LIGHTFLOW_PG_URL=postgres://... node dist/test/bench.js
 ```
 
-### v0.1.0 → v0.1.1 (before / after)
+### v0.1.1 → v0.1.2 (replay & timer round)
+
+Where the v0.1.1 gains were per-event write cost, v0.1.2 targets replay and
+timer dispatch:
+
+- **O(1) memo lookups during replay.** The event log is indexed once into a
+  `Map` (`"type:key" → event`); memo checks were linear `Array.find` scans,
+  making replay O(steps²) on long workflows.
+- **Fixed the timer index.** The `wakeAt` index was on the *text* extraction
+  but the query compared a *bigint* cast — Postgres silently ignored it. The
+  index now matches the query expression exactly.
+- **`dueTimers` anti-join.** Returns only timers not yet completed (one query
+  instead of a full `getEvents` per due timer in the worker), so timer wake-up
+  costs 2 queries instead of 1 + full-log fetch + resume.
+- **Adaptive worker poll (50ms → configured, backs off when idle) with an
+  optional LISTEN/NOTIFY wakeup** — notifications are a lossy nudge; polling
+  remains the correctness path. Same pattern PgQue and DBOS use.
+
+Measured (400-step workflows, 50 runs):
+
+| | v0.1.1 | v0.1.2 |
+|---|---|---|
+| Steps / sec, long workflows | 8,230 | **9,070** |
+| 100-step workflow throughput | — | 65 runs/s, 6,470 steps/s |
+| Worker queries per timer wake | ~4 + full log fetch | 2 |
+| Replay memo lookup | O(n) scan | O(1) Map |
+
+### v0.1.0 → v0.1.1 (event-append round)
 
 Same machine, same workload (200 runs × 5 steps, 20 in flight):
 

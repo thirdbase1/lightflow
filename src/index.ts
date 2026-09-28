@@ -51,7 +51,7 @@ export interface Store {
   appendEvent(e: StepEvent): Promise<void>;
   getEvents(runId: string): Promise<StepEvent[]>;
   /** Durable timers due at or before `now`. */
-  dueTimers(now: number): Promise<{ runId: string; seq: number }[]>;
+  dueTimers(now: number): Promise<{ runId: string; seq: number; key: string }[]>;
   claimDue(now: number): Promise<boolean>;
   /** Runs still 'running' with no activity since `cutoff` (epoch ms). */
   staleRuns?(cutoff: number): Promise<string[]>;
@@ -63,6 +63,15 @@ export interface Store {
   /** Run lease: claim (atomically) / release before executing a replay. */
   claimRun?(runId: string, leaseMs?: number): Promise<boolean>;
   releaseRun?(runId: string): Promise<void>;
+  /** Optional LISTEN/NOTIFY wakeup nudge for workers. */
+  notifyWake?(): Promise<void>;
+  /** Optional dedicated LISTEN client factory (pg Pool or Client). */
+  getListenClient?(): {
+    query(sql: string): Promise<unknown>;
+    on(event: "notification", cb: () => void): void;
+    release?(): void;
+  };
+
   /** Hooks: durable external callbacks a workflow can await. */
   createHook?(runId: string, token: string, key: string): Promise<void>;
   resolveHook?(token: string, payload: unknown): Promise<string | null>;
@@ -100,6 +109,8 @@ type Ctx = {
   hookCalls: number;
   store: Store;
   log: StepEvent[];
+  /** O(1) memo lookup: "type:key" -> event (built once at replay start) */
+  memo: Map<string, StepEvent>;
   /** index of events already consumed during replay */
   cursor: number;
   chunks: string[];
@@ -136,10 +147,8 @@ export async function step<T>(fn: () => Promise<T>): Promise<T> {
   const key = nextStepKey();
   ctx.stepCalls += 1;
 
-  // Replay: memoized result for this call position?
-  const done = ctx.log.find(
-    (e) => e.type === "step_completed" && (e.payload as { key: string })?.key === key,
-  );
+  // Replay: memoized result for this call position? (O(1) map lookup)
+  const done = ctx.memo.get(`step_completed:${key}`);
   if (done) return (done.payload as { value: T }).value;
 
   // Skip the step_started write entirely on the normal path: replay only
@@ -199,11 +208,8 @@ export async function sleep(until: number | Date): Promise<void> {
   const key = `sleep:${ctx.sleepCalls}`;
   ctx.sleepCalls += 1;
 
-  // Replay: already slept?
-  const done = ctx.log.find(
-    (e) => e.type === "sleep_completed" && (e.payload as { key: string })?.key === key,
-  );
-  if (done) return;
+  // Replay: already slept? (O(1) map lookup)
+  if (ctx.memo.has(`sleep_completed:${key}`)) return;
 
   ctx.seq += 1;
   await ctx.store.appendEvent({
@@ -232,10 +238,8 @@ export function getWritable<T = string>(): {
       // Memoized by call position (like steps): on replay, a write whose
       // position was already emitted is skipped, and the loop advances.
       const key = `w:${ctx.writes}`;
-      // Use the in-memory replay log — no per-write re-fetch of the event log.
-      const already = ctx.log.some(
-        (e) => e.type === "chunk" && (e.payload as { key?: string })?.key === key,
-      );
+      // Use the replay memo — no per-write re-fetch of the event log.
+      const already = ctx.memo.has(`chunk:${key}`);
       ctx.writes += 1;
       if (already) return;
       const index = await (ctx.store as unknown as {
@@ -248,7 +252,7 @@ export function getWritable<T = string>(): {
       });
     },
     async close() {
-      const already = ctx.log.some(
+      const already = [...ctx.memo.values()].some(
         (e) => e.type === "chunk" && (e.payload as { done?: boolean })?.done === true,
       );
       if (already) return;
@@ -345,11 +349,17 @@ export class Engine {
     if (claimer.claimRun && !(await claimer.claimRun(runId))) return;
 
     const log = await this.store.getEvents(runId);
+    // Memo index: one pass over the log, O(1) lookups during replay.
+    const memo = new Map<string, StepEvent>();
+    for (const e of log) {
+      const key = (e.payload as { key?: string }).key;
+      if (key !== undefined && key !== null) memo.set(`${e.type}:${key}`, e);
+    }
     const ctx: Ctx = {
       runId, seq: log.length ? log.reduce((m, e) => Math.max(m, e.seq), 0) + 1 : 1,
       stepCalls: 0, sleepCalls: 0, hookCalls: 0,
       writes: 0,
-      store: this.store, log, cursor: 0, chunks: [], now: () => Date.now(),
+      store: this.store, log, memo, cursor: 0, chunks: [], now: () => Date.now(),
     };
 
     const prev = current;
@@ -382,39 +392,50 @@ export class Engine {
 
   private workerStopped = false;
 
+  private listenClient?: { release?(): void };
+
   /** Signal the worker loop to exit after its current poll cycle. */
   stopWorker(): void {
     this.workerStopped = true;
+    this.listenClient?.release?.();
   }
 
   /** Worker loop: resume runs whose timers are due. Resolves when stopWorker() is called. */
   async startWorker(onError?: (e: unknown) => void): Promise<void> {
     this.workerStopped = false;
+    // Adaptive poll: snap to work when there is any, back off when idle.
+    let delay = this.opts.pollMs ?? 500;
+    const minDelay = 50;
+    // Optional LISTEN/NOTIFY: a dedicated client turns notifications into an
+    // immediate poll. Lossy by design — polling remains the correctness path.
+    let wake = () => { delay = minDelay; };
+    const listener = this.store.getListenClient?.();
+    if (listener) {
+      try {
+        await listener.query("LISTEN lightflow_wake");
+        listener.on("notification", () => wake());
+        this.listenClient = listener;
+      } catch { listener.release?.(); }
+    }
     while (!this.workerStopped) {
       try {
         const due = await this.store.dueTimers(Date.now());
+        if (due.length) delay = minDelay;
         for (const t of due) {
-          const ev = await this.store.getEvents(t.runId);
-          const created = ev.find((x) => x.seq === t.seq);
-          const key = (created?.payload as { key?: string } | undefined)?.key
-            ?? `sleep:${t.seq}`;
-          const alreadyDone = ev.some(
-            (x) => x.type === "sleep_completed" &&
-                   (x.payload as { key?: string })?.key === key,
-          );
-          if (alreadyDone) continue;
+          // dueTimers() already excludes completed timers (anti-join), so no
+          // per-timer getEvents round trip: complete directly and resume.
           await this.store.appendEvent({
-            runId: t.runId, seq: ev.reduce((m, e) => Math.max(m, e.seq), 0) + 1,
-            type: "sleep_completed", payload: { key }, createdAt: Date.now(),
+            runId: t.runId, seq: t.seq + 1_000_000, // collision-proof offset; ON CONFLICT handles races
+            type: "sleep_completed", payload: { key: t.key }, createdAt: Date.now(),
           });
           const row = await this.store.getRun(t.runId);
           if (!row || row.status !== "running") continue;
-          // resume: re-run with replay; sleep is memoized now
           void this.resume(t.runId);
         }
         await this.reapStale(onError);
       } catch (e) { onError?.(e); }
-      await new Promise((r) => setTimeout(r, this.opts.pollMs ?? 500));
+      await new Promise((r) => setTimeout(r, delay));
+      delay = Math.min(Math.round(delay * 1.5), this.opts.pollMs ?? 500);
     }
   }
 

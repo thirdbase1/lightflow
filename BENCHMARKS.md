@@ -108,6 +108,30 @@ snapshots land before each resume.
 
 ---
 
+## v0.1.4 — round-trip & fsync round
+
+**Focus: query-count per run and the commit durability dial.**
+
+- **Merged control round trips**: `claimRun` returns the cancelled flag with
+  the lease; new `finishRun` writes terminal status and releases the lease in
+  one UPDATE. Control queries per run: 6 → 4.
+- **Pipelined step appends**: consecutive `step_completed` events share one
+  flush (buffered in `ctx.inflight`, awaited at suspension/terminal/snapshot
+  boundaries). Verified: 700-step sleep-resume path stays correct.
+- **Opt-in async commit** (`sessionOptions: { synchronous_commit: 'off' }`):
+  documented tradeoff — the last few transactions may be lost on a server
+  crash (never corruption). Off by default; durability remains the default.
+
+| Metric | v0.1.3 | v0.1.4 | Δ |
+|---|---|---|---|
+| Runs / sec (200×5, conc 20) | 437–480 | **502–512** | +8% |
+| Runs / sec (500×10, conc 100) | 497 | **503–512** | +2% |
+| Steps / sec (400-step) | 8,956 | **9,017–9,939** | +5% |
+| Steps / sec (400-step, async commit opt-in) | — | **11,004** | +23% vs durable |
+| Control queries per run | 6 | 4 | −33% |
+
+---
+
 ## Reproducing
 
 `test/bench.ts` honours `BENCH_N` (runs), `BENCH_M` (steps per run),

@@ -11,10 +11,23 @@ export type Store = import("../src/index.js").Store;
 type StepEvent = import("../src/index.js").StepEvent;
 type RunStatus = import("../src/index.js").RunStatus;
 
-export async function createPostgresStore(url: string): Promise<Store> {
+export async function createPostgresStore(
+  url: string,
+  opts: { /** Session-level SET options, e.g. { synchronous_commit: 'off' } */
+    sessionOptions?: Record<string, string> } = {},
+): Promise<Store> {
   // Pipelining (pg >= 8.23): batch queries on one connection instead of one
   // round trip per query — 1.5-2.4x on multi-query workloads.
   const pool = new pg.Pool({ connectionString: url, max: 20, pipeline: true });
+  if (opts.sessionOptions) {
+    const sets = Object.entries(opts.sessionOptions)
+      .map(([k, v]) => `SET ${k} = ${v === "off" || v === "on" ? v : `'${v}'`}`)
+      .join("; ");
+    // Apply per connection as it opens (pg fires 'connect' per client).
+    pool.on("connect", (client) => {
+      void client.query(sets).catch(() => {});
+    });
+  }
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS lightflow_runs (

@@ -44,6 +44,11 @@ export async function createPostgresStore(url: string): Promise<Store> {
   await pool.query(`
     ALTER TABLE lightflow_runs ADD COLUMN IF NOT EXISTS cancelled BOOLEAN NOT NULL DEFAULT false;
   `);
+  // Run lease: prevents racing replays (two workers resuming the same run)
+  // from re-executing steps concurrently. Claimed = someone is executing.
+  await pool.query(`
+    ALTER TABLE lightflow_runs ADD COLUMN IF NOT EXISTS claimed_until BIGINT NOT NULL DEFAULT 0;
+  `);
   // Durable hooks: an external caller resolves a token, the workflow wakes.
   await pool.query(`
     CREATE TABLE IF NOT EXISTS lightflow_hooks (
@@ -78,15 +83,15 @@ export async function createPostgresStore(url: string): Promise<Store> {
   return {
     async createRun(runId, name, input) {
       const now = Date.now();
+      // One round trip: run row + start event, atomically.
       await pool.query(
-        `INSERT INTO lightflow_runs (run_id, name, status, input, created_at, updated_at)
-         VALUES ($1,$2,'running',$3,$4,$4) ON CONFLICT (run_id) DO NOTHING`,
-        [runId, name, JSON.stringify(input), now],
-      );
-      await pool.query(
-        `INSERT INTO lightflow_events (run_id, seq, type, payload, created_at)
-         VALUES ($1,0,'run_completed',$2,$3) ON CONFLICT DO NOTHING`,
-        [runId, JSON.stringify({ name, args: input }), now],
+        `WITH ins AS (
+           INSERT INTO lightflow_runs (run_id, name, status, input, created_at, updated_at)
+           VALUES ($1,$2,'running',$3,$4,$4) ON CONFLICT (run_id) DO NOTHING
+         )
+         INSERT INTO lightflow_events (run_id, seq, type, payload, created_at)
+         VALUES ($1,0,'run_completed',$5,$4) ON CONFLICT DO NOTHING`,
+        [runId, name, JSON.stringify(input), now, JSON.stringify({ name, args: input })],
       );
     },
 
@@ -98,53 +103,70 @@ export async function createPostgresStore(url: string): Promise<Store> {
     },
 
     async appendEvent(e: StepEvent) {
-      if (e.type === "chunk") {
-        // Exactly-once by write key, decided INSIDE the advisory lock so two
-        // racing replays cannot both pass the check-then-insert window.
-        const c = await pool.connect();
-        try {
-          await c.query("BEGIN");
-          await c.query("SELECT pg_advisory_xact_lock(hashtext($1))", [e.runId]);
-          const key = (e.payload as { key?: string }).key;
-          if (key) {
-            const dup = await c.query(
-              `SELECT 1 FROM lightflow_events
-               WHERE run_id=$1 AND type='chunk' AND payload->>'key'=$2 LIMIT 1`,
-              [e.runId, key]);
-            if (dup.rowCount) { await c.query("COMMIT"); return; }
-          }
-          const r = await c.query(
-            `SELECT COALESCE(max(seq),-1)+1 AS seq FROM lightflow_events WHERE run_id=$1`,
-            [e.runId]);
-          await c.query(
-            `INSERT INTO lightflow_events (run_id, seq, type, payload, created_at)
-             VALUES ($1,$2,$3,$4,$5)
-             ON CONFLICT (run_id, (payload->>'index')) WHERE type='chunk' DO NOTHING`,
-            [e.runId, r.rows[0].seq, e.type, JSON.stringify(e.payload), e.createdAt]);
-          await c.query("COMMIT");
-        } catch (err) {
-          await c.query("ROLLBACK").catch(() => {});
-          const msg = err instanceof Error ? err.message : String(err);
-          if (!/duplicate key value/.test(msg)) throw err;
-          // duplicate chunk from a replayed tick: expected, ignore
-        } finally { c.release(); }
-        return;
+      const payload = JSON.stringify(e.payload);
+      // FAST PATH: one statement, caller-supplied seq. The (run_id, seq) unique
+      // constraint makes this atomic; the chunk-key unique index makes a
+      // replayed write a harmless no-op. No advisory lock, no max(seq) scan,
+      // no explicit transaction (single statements are already atomic).
+      try {
+        const r = await pool.query(
+          `INSERT INTO lightflow_events (run_id, seq, type, payload, created_at)
+           VALUES ($1,$2,$3,$4,$5)
+           ON CONFLICT DO NOTHING`,
+          [e.runId, e.seq, e.type, payload, e.createdAt],
+        );
+        if (r.rowCount) return;
+        // Conflict: either a racing replay appended the SAME event (same
+        // type+key) -> drop, or a DIFFERENT event took this seq -> slow path.
+        const key = (e.payload as { key?: string }).key;
+        if (key) {
+          const dup = await pool.query(
+            `SELECT 1 FROM lightflow_events
+             WHERE run_id=$1 AND type=$2 AND payload->>'key'=$3 LIMIT 1`,
+            [e.runId, e.type, key]);
+          if (dup.rowCount) return; // racing replay lost: memoized event exists
+        }
+      } catch (err: unknown) {
+        const code = (err as { code?: string }).code;
+        if (code === "23505" && (e.type as string) === "chunk") return;
+        if (code !== "23505") throw err;
       }
+      // SLOW PATH (rare): allocate seq under the advisory lock.
       const c = await pool.connect();
       try {
         await c.query("BEGIN");
-        await c.query(
-          "SELECT pg_advisory_xact_lock(hashtext($1))", [e.runId]);
+        await c.query("SELECT pg_advisory_xact_lock(hashtext($1))", [e.runId]);
+        const key = (e.payload as { key?: string }).key;
+        if (key) {
+          // Re-check dedupe under the lock: a racing replay's insert may have
+          // committed after our unlocked check ran.
+          const dup = await c.query(
+            `SELECT 1 FROM lightflow_events
+             WHERE run_id=$1 AND type=$2 AND payload->>'key'=$3 LIMIT 1`,
+            [e.runId, e.type, key]);
+          if (dup.rowCount) { await c.query("COMMIT"); return; }
+        }
+        if (e.type === "chunk" && key) {
+          const dup = await c.query(
+            `SELECT 1 FROM lightflow_events
+             WHERE run_id=$1 AND type='chunk' AND payload->>'key'=$2 LIMIT 1`,
+            [e.runId, key]);
+          if (dup.rowCount) { await c.query("COMMIT"); return; }
+        }
         const r = await c.query(
           `SELECT COALESCE(max(seq),-1)+1 AS seq FROM lightflow_events WHERE run_id=$1`,
           [e.runId]);
         await c.query(
           `INSERT INTO lightflow_events (run_id, seq, type, payload, created_at)
-           VALUES ($1,$2,$3,$4,$5) ON CONFLICT (run_id, seq) DO NOTHING`,
-          [e.runId, r.rows[0].seq, e.type, JSON.stringify(e.payload), e.createdAt]);
+           VALUES ($1,$2,$3,$4,$5)
+           ON CONFLICT (run_id, seq) DO NOTHING`,
+          [e.runId, r.rows[0].seq, e.type, payload, e.createdAt]);
         await c.query("COMMIT");
-      } catch (err) { await c.query("ROLLBACK").catch(() => {}); throw err; }
-      finally { c.release(); }
+      } catch (err) {
+        await c.query("ROLLBACK").catch(() => {});
+        const msg = err instanceof Error ? err.message : String(err);
+        if (!/duplicate key value/.test(msg)) throw err;
+      } finally { c.release(); }
     },
 
     async getEvents(runId) {
@@ -165,6 +187,24 @@ export async function createPostgresStore(url: string): Promise<Store> {
     },
 
     async claimDue() { return false; },
+
+    async claimRun(runId, leaseMs = 30_000) {
+      const now = Date.now();
+      const r = await pool.query(
+        `UPDATE lightflow_runs SET claimed_until=$2, updated_at=$3
+         WHERE run_id=$1 AND claimed_until < $3
+         RETURNING run_id`,
+        [runId, now + leaseMs, now],
+      );
+      return (r.rowCount ?? 0) > 0;
+    },
+
+    async releaseRun(runId) {
+      await pool.query(
+        `UPDATE lightflow_runs SET claimed_until=0 WHERE run_id=$1 AND claimed_until > 0`,
+        [runId],
+      );
+    },
 
     async nextChunkIndex(runId) {
       const r = await pool.query(

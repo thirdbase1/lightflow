@@ -1,6 +1,6 @@
 {
   "name": "lightflow-engine",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "A tiny durable workflow engine for Node.js and Postgres: steps that run at most once, timers that survive crashes, streams that replay exactly once.",
   "license": "MIT",
   "type": "module",

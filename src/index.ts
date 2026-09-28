@@ -60,6 +60,9 @@ export interface Store {
   isCancelled?(runId: string): Promise<boolean>;
   /** Next monotonic chunk index (max+1), atomic per run. */
   nextChunkIndex?(runId: string): Promise<number>;
+  /** Run lease: claim (atomically) / release before executing a replay. */
+  claimRun?(runId: string, leaseMs?: number): Promise<boolean>;
+  releaseRun?(runId: string): Promise<void>;
   /** Hooks: durable external callbacks a workflow can await. */
   createHook?(runId: string, token: string, key: string): Promise<void>;
   resolveHook?(token: string, payload: unknown): Promise<string | null>;
@@ -139,11 +142,9 @@ export async function step<T>(fn: () => Promise<T>): Promise<T> {
   );
   if (done) return (done.payload as { value: T }).value;
 
+  // Skip the step_started write entirely on the normal path: replay only
+  // consults step_completed / step_failed, so starting is implicit.
   ctx.seq += 1;
-  await ctx.store.appendEvent({
-    runId: ctx.runId, seq: ctx.seq, type: "step_started",
-    payload: { key }, createdAt: ctx.now(),
-  });
 
   const fnId = (fn as unknown as { __lightflowStepId?: string }).__lightflowStepId;
   const impl = fnId ? steps.get(fnId) : undefined;
@@ -231,8 +232,8 @@ export function getWritable<T = string>(): {
       // Memoized by call position (like steps): on replay, a write whose
       // position was already emitted is skipped, and the loop advances.
       const key = `w:${ctx.writes}`;
-      const fresh = await ctx.store.getEvents(ctx.runId);
-      const already = fresh.some(
+      // Use the in-memory replay log — no per-write re-fetch of the event log.
+      const already = ctx.log.some(
         (e) => e.type === "chunk" && (e.payload as { key?: string })?.key === key,
       );
       ctx.writes += 1;
@@ -298,10 +299,14 @@ export class Engine {
 
   private async waitFor(runId: string): Promise<unknown> {
     const deadline = Date.now() + 10 * 60_000;
+    // Adaptive poll: fast at first (most runs finish in ms), backing off so
+    // long waits don't hammer the database.
+    let delay = 5;
     while (Date.now() < deadline) {
       const row = await this.store.getRun(runId);
       if (row && row.status !== "running") return row.output ?? null;
-      await new Promise((r) => setTimeout(r, 250));
+      await new Promise((r) => setTimeout(r, delay));
+      delay = Math.min(delay * 1.6, 250);
     }
     throw new Error("returnValue timeout");
   }
@@ -327,10 +332,17 @@ export class Engine {
     });
   }
 
-  /** Execute (or resume) a run. Safe to call repeatedly — replay is idempotent. */
+  /** Execute (or resume) a run. Racing resumes are arbitrated by a lease. */
   async run(runId: string, workflowId: string, args: unknown[]): Promise<void> {
     const fn = workflows.get(workflowId);
     if (!fn) throw new Error(`unknown workflow: ${workflowId}`);
+
+    // Run lease: only one replay executes at a time. A racing resume that
+    // loses exits immediately — its side effects are already being written
+    // by the winner, and any newer events it would have seen are picked up
+    // by the next resume.
+    const claimer: Pick<Store, "claimRun" | "releaseRun"> = this.store;
+    if (claimer.claimRun && !(await claimer.claimRun(runId))) return;
 
     const log = await this.store.getEvents(runId);
     const ctx: Ctx = {
@@ -364,6 +376,7 @@ export class Engine {
       });
     } finally {
       current = prev;
+      await claimer.releaseRun?.(runId);
     }
   }
 

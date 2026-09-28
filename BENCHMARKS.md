@@ -160,6 +160,7 @@ same Postgres (16, local) and the same harness (200 runs x 5 steps @ conc 20;
 | 0.2.8 | 455.2 | 2,276 | 8,695 |
 | 0.2.9 | 474.1 | 2,371 | 9,008 |
 | 0.2.10 | 455.3 | 2,277 | 9,368 |
+| 0.2.12 | 457.0 | 2,285 | 9,943 |
 
 ### What changed per version (all perf-neutral by design)
 
@@ -209,3 +210,13 @@ ln -s <path-to>/lightflow/node_modules <dir>/node_modules
 PKG=<dir> LIGHTFLOW_PG_URL=postgres://... BENCH_N=200 RN=5 npx tsx bench-pkg.mts
 PKG=<dir> LIGHTFLOW_PG_URL=postgres://... BENCH_N=50 RN=400 npx tsx bench-pkg.mts
 ```
+
+### 0.2.12 — bug-fix release (cancel/reaper/chunk)
+
+- **cancel is terminal**: `cancel()` now writes `status='cancelled'` + flag atomically; `finishRun` refuses to overwrite a cancelled run (was: racing replay resurrected the run as completed/failed). `RunStatus` gains `"cancelled"`.
+- **Lease-aware stale reaper**: `staleRuns` only reaps runs whose lease expired — a run inside a long step is no longer double-executed.
+- **Stream close marker**: `close()` uses a monotonic chunk index (was `ctx.writes`, which could collide and silently drop the done marker → hanging stream).
+- **O(1) nextChunkIndex**: `lightflow_runs.chunk_count` counter replaces a full chunk scan per write — long-run steps/s 9,368 → ~9,900.
+- Tidy: single `getCurrent()` per call site (was double call + `!`).
+
+Short: 200×5 conc 20 → **457 runs/s / 2,285 steps/s** (within noise of 0.2.9/0.2.10). Long: 50×400 → **9,943 steps/s** (best recorded).

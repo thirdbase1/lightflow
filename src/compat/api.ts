@@ -19,6 +19,8 @@ export type VercelRunStatus =
 
 export type VercelRun = {
   runId: string;
+  /** Vercel's run handle exposes exists; ours always resolves from the DB. */
+  readonly exists: true;
   /** Live getter: each access returns a FRESH promise snapshotting the
    *  current status ("pending"/"running" until terminal). Vercel's is a
    *  getter too (chat.test.ts mocks `get status()`), and entry-agents'
@@ -92,6 +94,7 @@ function makeRunHandle(runId: string): VercelRun {
   const cache: { status?: VercelRunStatus } = {};
   const handle: VercelRun = {
     runId,
+    exists: true,
     get status() {
       // Live snapshot: resolve immediately with the current state; the
       // startStopMonitor poll loop relies on this re-reading each tick.

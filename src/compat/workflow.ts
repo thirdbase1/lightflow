@@ -19,6 +19,9 @@ import { current } from "../index.js";
 
 export { FatalError, CancelledError, sleep } from "../index.js";
 export { getWorkflowMetadata } from "../compat/metadata.js";
+// Vercel exports the step-aware fetch under both names; entry-agents
+// imports `fetch as workflowFetch` in some files and plain `fetch` in others.
+export { workflowFetch as fetch } from "../compat/fetch.js";
 export { workflowFetch } from "../compat/fetch.js";
 
 /**

@@ -85,7 +85,8 @@ export interface Store {
 /* Registry: workflows and steps are resolved by a stable id           */
 /* ------------------------------------------------------------------ */
 
-type WorkflowFn = (...args: unknown[]) => Promise<unknown>;
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+ type WorkflowFn = (...args: any[]) => Promise<unknown>;
 
 const workflows = new Map<string, WorkflowFn>();
 const steps = new Map<string, (...a: unknown[]) => Promise<unknown>>();

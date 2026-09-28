@@ -228,19 +228,30 @@ export async function createPostgresStore(url: string): Promise<Store> {
 
     async claimRun(runId, leaseMs = 30_000) {
       const now = Date.now();
+      // One round trip: claim the lease AND read the cancelled flag.
       const r = await pool.query(
         `UPDATE lightflow_runs SET claimed_until=$2, updated_at=$3
          WHERE run_id=$1 AND claimed_until < $3
-         RETURNING run_id`,
+         RETURNING cancelled`,
         [runId, now + leaseMs, now],
       );
-      return (r.rowCount ?? 0) > 0;
+      return { ok: (r.rowCount ?? 0) > 0, cancelled: r.rows[0]?.cancelled === true };
     },
 
     async releaseRun(runId) {
       await pool.query(
         `UPDATE lightflow_runs SET claimed_until=0 WHERE run_id=$1 AND claimed_until > 0`,
         [runId],
+      );
+    },
+
+    /** Terminal status + lease release in one round trip. */
+    async finishRun(runId, status, output) {
+      await pool.query(
+        `UPDATE lightflow_runs
+         SET status=$2, output=$3, claimed_until=0, updated_at=$4
+         WHERE run_id=$1`,
+        [runId, status, output === undefined ? null : JSON.stringify(output), Date.now()],
       );
     },
 

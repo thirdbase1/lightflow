@@ -61,8 +61,10 @@ export interface Store {
   /** Next monotonic chunk index (max+1), atomic per run. */
   nextChunkIndex?(runId: string): Promise<number>;
   /** Run lease: claim (atomically) / release before executing a replay. */
-  claimRun?(runId: string, leaseMs?: number): Promise<boolean>;
+  claimRun?(runId: string, leaseMs?: number): Promise<{ ok: boolean; cancelled: boolean }>;
   releaseRun?(runId: string): Promise<void>;
+  /** Terminal status + lease release in one round trip. */
+  finishRun?(runId: string, status: RunStatus, output?: unknown): Promise<void>;
   /** Optional LISTEN/NOTIFY wakeup nudge for workers. */
   notifyWake?(): Promise<void>;
   /** Optional dedicated LISTEN client factory (pg Pool or Client). */
@@ -115,6 +117,10 @@ type Ctx = {
   completedNow: number;
   /** results of steps completed this execution: key -> value */
   freshResults: Map<string, unknown>;
+  /** in-flight append promises: flushed at suspension points / run end */
+  inflight: Promise<void>[];
+  /** appends an event, pipelining it with others already in flight */
+  append(e: StepEvent): Promise<void>;
   /** index of events already consumed during replay */
   cursor: number;
   chunks: string[];
@@ -195,7 +201,7 @@ export async function step<T>(fn: () => Promise<T>): Promise<T> {
 
   ctx.seq += 1;
   ctx.freshResults.set(key, value);
-  await ctx.store.appendEvent({
+  ctx.append({
     runId: ctx.runId, seq: ctx.seq, type: "step_completed",
     payload: { key, value }, createdAt: ctx.now(),
   });
@@ -213,6 +219,7 @@ const SNAPSHOT_MIN_EVENTS = 100;
  * costing replay time and can be pruned later without breaking resumes.
  */
 async function maybeSnapshot(ctx: Ctx): Promise<void> {
+  await Promise.all(ctx.inflight);
   ctx.completedNow += 1;
   const done = ctx.completedNow +
     [...ctx.memo.values()].filter((e) => e.type === "step_completed").length;
@@ -405,7 +412,12 @@ export class Engine {
     // by the winner, and any newer events it would have seen are picked up
     // by the next resume.
     const claimer: Pick<Store, "claimRun" | "releaseRun"> = this.store;
-    if (claimer.claimRun && !(await claimer.claimRun(runId))) return;
+    const claim = await claimer.claimRun?.(runId);
+    if (claim && !claim.ok) return;
+    if (claim?.cancelled) {
+      await this.store.setStatus(runId, "failed", { error: "cancelled" });
+      return;
+    }
 
     const log = await this.store.getEvents(runId);
     // Memo index: one pass over the log, O(1) lookups during replay.
@@ -435,25 +447,36 @@ export class Engine {
       runId, seq: log.length ? log.reduce((m, e) => Math.max(m, e.seq), 0) + 1 : 1,
       stepCalls: 0, sleepCalls: 0, hookCalls: 0,
       writes: 0,
-      store: this.store, log, memo, completedNow: 0, freshResults: new Map(), cursor: 0, chunks: [], now: () => Date.now(),
+      store: this.store, log, memo, completedNow: 0, freshResults: new Map(),
+      inflight: [], cursor: 0, chunks: [], now: () => Date.now(),
+      append: (e) => {
+        // Pipelined append: capture the promise; callers only await at
+        // suspension/end, so several step completions share one flush.
+        const p = ctx.store.appendEvent(e).then(() => { ctx.inflight = ctx.inflight.filter(x => x !== p); });
+        ctx.inflight.push(p);
+        return p;
+      },
     };
 
     const prev = current;
     current = ctx;
     try {
-      if (await this.store.isCancelled?.(runId)) {
-        await this.store.setStatus(runId, "failed", { error: "cancelled" });
-        return;
-      }
       const output = await fn(...args);
-      await this.store.setStatus(runId, "completed", output);
+      await Promise.all(ctx.inflight);
+      await (this.store.finishRun?.(runId, "completed", output)
+        ?? this.store.setStatus(runId, "completed", output));
       this.local.get(runId)?.resolve(output);
     } catch (err) {
-      if (err instanceof SuspendSignal) return; // waiting on a timer
+      if (err instanceof SuspendSignal) {
+        await Promise.all(ctx.inflight);
+        return; // waiting on a timer
+      }
       const fail = async (error: unknown) => {
-        await this.store.setStatus(runId, "failed", {
+        await (this.store.finishRun?.(runId, "failed", {
           error: error instanceof Error ? error.message : String(error),
-        });
+        }) ?? this.store.setStatus(runId, "failed", {
+          error: error instanceof Error ? error.message : String(error),
+        }));
         this.local.get(runId)?.reject(
           err instanceof Error ? err : new Error(String(err)));
       };

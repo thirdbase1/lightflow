@@ -10,7 +10,11 @@
     ".": "./dist/index.js",
     "./pg": "./dist/pg-store.js"
   },
-  "files": ["dist", "README.md", "LICENSE"],
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
   "keywords": [
     "workflow",
     "durable-execution",
@@ -19,10 +23,12 @@
     "queue",
     "temporal"
   ],
-  "engines": { "node": ">=20" },
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "test": "node --test dist/test/",
+    "test": "node --test dist/test/smoke.js",
     "prepublishOnly": "npm run build"
   },
   "dependencies": {
@@ -37,6 +43,8 @@
     "type": "git",
     "url": "git+https://github.com/thirdbase1/lightflow.git"
   },
-  "bugs": { "url": "https://github.com/thirdbase1/lightflow/issues" },
+  "bugs": {
+    "url": "https://github.com/thirdbase1/lightflow/issues"
+  },
   "homepage": "https://github.com/thirdbase1/lightflow#readme"
 }

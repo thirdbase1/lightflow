@@ -47,6 +47,13 @@ export LIGHTFLOW_PG_URL=postgres://lightflow:lightflow@localhost:5432/lightflow_
 - Dashboard/UI (planned, not designed)
 - Windows support for the test harness (kill-tests use SIGKILL)
 
+## Release process (every version)
+
+1. `tsc` clean + test suite green.
+2. Bench from the tarball and add a BENCHMARKS.md row/changelog note.
+3. Commit, `npm version patch` (or minor), `npm publish`, `git push origin main --tags`.
+4. Create a **detailed GitHub Release** per tag via the API (`POST /repos/thirdbase1/lightflow/releases`): Fixed / Added / Verified sections, upgrade command. See v0.2.14 and v0.2.15 for the format.
+
 ## License
 
 By contributing you agree your contributions are licensed under the MIT

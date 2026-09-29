@@ -1,6 +1,6 @@
 {
   "name": "lightflow-engine",
-  "version": "0.2.13",
+  "version": "0.2.14",
   "description": "A tiny durable workflow engine for Node.js and Postgres — with a Vercel Workflow drop-in compat layer.",
   "license": "MIT",
   "type": "module",

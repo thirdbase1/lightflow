@@ -159,6 +159,14 @@ API surface (`start(fn, args)`, sync `getRun()`, `run.status` Promise,
 See [COMPAT.md](./COMPAT.md) for the 3-step swap guide and honest
 differences list.
 
+### Self-hosting the worker (Pxxl, VPS, Fly, Railway)
+
+Serverless hosts freeze between requests, so the polling worker must live on
+an always-on runtime. See [docs/pxxl-worker.md](./docs/pxxl-worker.md) for a
+step-by-step Pxxl deployment (worker service type, secrets, health check,
+registering workflow functions) — the same pattern works on any VPS or
+long-running container host: `LIGHTFLOW_PG_URL=... node dist/worker.js`.
+
 ```ts
 import { createPostgresStore } from "lightflow-engine/pg";
 import { Engine } from "lightflow-engine";

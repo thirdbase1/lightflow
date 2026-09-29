@@ -1,7 +1,7 @@
 {
   "name": "lightflow-engine",
   "version": "0.2.16",
-  "description": "A tiny durable workflow engine for Node.js and Postgres — with a Vercel Workflow drop-in compat layer.",
+  "description": "A tiny durable workflow engine for Node.js and Postgres \u2014 with a Vercel Workflow drop-in compat layer.",
   "license": "MIT",
   "type": "module",
   "main": "dist/index.js",
@@ -52,7 +52,8 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "test": "node --test dist/test/smoke.js",
-    "prepublishOnly": "npm run build"
+    "prepublishOnly": "npm run build",
+    "start": "node dist/worker.js"
   },
   "dependencies": {
     "pg": "^8.13.0"

@@ -162,10 +162,13 @@ differences list.
 ### Self-hosting the worker (Pxxl, VPS, Fly, Railway)
 
 Serverless hosts freeze between requests, so the polling worker must live on
-an always-on runtime. See [docs/pxxl-worker.md](./docs/pxxl-worker.md) for a
-step-by-step Pxxl deployment (worker service type, secrets, health check,
-registering workflow functions) — the same pattern works on any VPS or
-long-running container host: `LIGHTFLOW_PG_URL=... node dist/worker.js`.
+an always-on runtime. See [docs/brimble-worker.md](./docs/brimble-worker.md)
+for a step-by-step Brimble deployment (first-class Worker service type,
+process-liveness health, managed Postgres, env vars) or
+[docs/pxxl-worker.md](./docs/pxxl-worker.md) for Pxxl (worker service,
+Multi-Service `pxxl.toml`, secrets, health check). The same pattern works on
+any VPS or long-running container host:
+`LIGHTFLOW_PG_URL=... node dist/worker.js`.
 
 ```ts
 import { createPostgresStore } from "lightflow-engine/pg";
